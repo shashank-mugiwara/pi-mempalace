@@ -18,11 +18,11 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
-import { DynamicBorder } from "@mariozechner/pi-coding-agent";
-import { Container, Spacer, Text } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import type { MemoryStats } from "./memory_store.js";
-import { Type } from "@sinclair/typebox";
+import { Type } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -929,7 +929,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
           }
         }
         
-        return textResult(text, stats);
+        return textResult(text, stats as unknown as Record<string, unknown>);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return textResult(`Knowledge status failed: ${msg}`);

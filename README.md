@@ -57,17 +57,22 @@ Measured on the live store (4 representative queries, top-8 results):
 
 ## Deployment in this setup
 
-- **Runtime (what pi loads):** `~/.pi/agent/npm/node_modules/pi-mempalace/`
-  (installed via the `npm:pi-mempalace` entry in `~/.pi/agent/settings.json`).
-  The fix is applied there so it takes effect on the next pi restart, and the
-  prebuilt native `better-sqlite3` is reused.
-- **Source of truth (version control):** this repo, checked out locally under
-  `~/.pi` and pushed to GitHub.
-- **Recovery after a pi reinstall/update:** run [`./apply.sh`](./apply.sh) to
-  re-copy the patched extension files into the runtime.
+- **Runtime (what pi loads):** a pinned git package clone managed by pi from
+  `git:github.com/shashank-mugiwara/pi-mempalace@<commit>`.
+- **Source of truth (version control):** this repo / GitHub fork. Pi should not
+  load the upstream `npm:pi-mempalace` package in this setup.
+- **Old bridge retired:** the earlier `npm:pi-mempalace` + [`./apply.sh`](./apply.sh)
+  patched-runtime workflow is kept only as historical fallback. The clean path is
+  one git package source in `~/.pi/agent/settings.json`.
 
-```bash
-./apply.sh        # repo → ~/.pi/agent/npm/node_modules/pi-mempalace, then restart pi
+Example settings entry:
+
+```json
+{
+  "source": "git:github.com/shashank-mugiwara/pi-mempalace@<commit>",
+  "extensions": ["+extensions/pi-mempalace/index.ts"],
+  "skills": ["+skills/memory-setup/SKILL.md"]
+}
 ```
 
 ## Memory is model-managed

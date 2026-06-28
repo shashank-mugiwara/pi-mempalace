@@ -1,5 +1,14 @@
 # Fork changelog
 
+## 0.3.1 — 2026-06-28 — direct git-package install compatibility
+
+- Updated extension imports from legacy `@mariozechner/*` package names to current
+  `@earendil-works/*` package names used by pi `0.80.x`.
+- Updated peer/dev dependencies accordingly and removed the direct `@sinclair/typebox`
+  peer by importing `Type` from `@earendil-works/pi-ai`.
+- Intended install mode is a pinned git package source in `~/.pi/agent/settings.json`,
+  replacing the older `npm:pi-mempalace` + `apply.sh` patched-runtime bridge.
+
 ## 0.3.0 — 2026-06-23 — retrieval-pollution fix
 
 ### Diagnosis
