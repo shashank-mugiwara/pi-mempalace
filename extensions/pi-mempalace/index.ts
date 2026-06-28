@@ -21,7 +21,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
-import type { MemoryStats } from "./memory_store.js";
+import type { MemoryStats, TaxonomyNode } from "./memory_store.js";
 import { Type } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -39,6 +39,17 @@ const MEMORY_DIR = path.join(
   "memory"
 );
 const CONFIG_PATH = path.join(MEMORY_DIR, "config.json");
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Max chars appended to system prompt for the taxonomy section. */
+const MAX_TAXONOMY_CHARS = 3500;
+/** Max topics to show per project before truncating (keeps lines compact, model can call memory_taxonomy for full list). */
+const MAX_TOPICS_PER_PROJECT = 5;
+/** Skip projects with fewer memories than this — reduces noise from one-off projects. */
+const MIN_PROJECT_MEMORIES = 5;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -66,12 +77,59 @@ interface MemoryRuntime {
   backendAvailable: boolean;
   /** Cached wake-up text (refreshed on session_start) */
   wakeUpText: string | null;
+  /** Cached taxonomy text for system prompt injection (refreshed on session_start) */
+  taxonomyText: string | null;
   /** Current project context */
   currentProject: string;
   /** Whether memory mode is enabled */
   enabled: boolean;
   /** The memory store instance */
   store: MemoryStore;
+}
+
+// ---------------------------------------------------------------------------
+// Taxonomy helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Render a compact project → topic(count) index for system-prompt injection.
+ * Helps the model know what memory regions exist before it calls memory_search.
+ */
+function buildTaxonomySection(taxonomy: TaxonomyNode[]): string | null {
+  if (!taxonomy || taxonomy.length === 0) return null;
+
+  const lines: string[] = [
+    "## Memory — Taxonomy (what's stored)",
+    "Projects and topics in the memory palace. Use `memory_recall(project, topic)` or `memory_search(query)` to retrieve:",
+    "",
+  ];
+
+  for (const node of taxonomy) {
+    // Skip tiny projects — they add noise without actionable recall targets.
+    if (node.total < MIN_PROJECT_MEMORIES) continue;
+    const shown = node.topics.slice(0, MAX_TOPICS_PER_PROJECT);
+    const more = node.topics.length > MAX_TOPICS_PER_PROJECT
+      ? ` +${node.topics.length - MAX_TOPICS_PER_PROJECT} more`
+      : "";
+    const topicList = shown.map(t => `${t.topic}(${t.count})`).join(", ");
+    lines.push(`- **${node.project}** (${node.total}): ${topicList}${more}`);
+  }
+
+  // Truncate at project boundary (not mid-line) to keep the output clean.
+  const header = lines.slice(0, 3).join("\n");
+  const projectLines = lines.slice(3);
+  let result = header;
+  let truncated = false;
+  for (const line of projectLines) {
+    const candidate = result + "\n" + line;
+    if (candidate.length > MAX_TAXONOMY_CHARS) {
+      truncated = true;
+      break;
+    }
+    result = candidate;
+  }
+  if (truncated) result += "\n\n*…more projects available — call `memory_taxonomy()` for the full list.*";
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +152,7 @@ function createRuntime(): MemoryRuntime {
     projects: {},
     backendAvailable: false,
     wakeUpText: null,
+    taxonomyText: null,
     currentProject: "general",
     enabled: true,
     store: new MemoryStore(),
@@ -353,6 +412,14 @@ export default function memoryExtension(pi: ExtensionAPI) {
       } catch {
         runtime.wakeUpText = null;
       }
+
+      // Pre-compute taxonomy for system-prompt injection (shows all projects/topics).
+      try {
+        const taxonomy = runtime.store.getTaxonomy();
+        runtime.taxonomyText = buildTaxonomySection(taxonomy);
+      } catch {
+        runtime.taxonomyText = null;
+      }
     }
   };
 
@@ -428,23 +495,33 @@ export default function memoryExtension(pi: ExtensionAPI) {
     }
   });
 
-  // Inject wake-up context into system prompt
+  // Inject wake-up context + taxonomy index into system prompt
   pi.on("before_agent_start", async (event, ctx) => {
     const runtime = getRuntime(ctx);
     if (!runtime.enabled || !runtime.config.wakeUpEnabled) return;
-    if (!runtime.wakeUpText) return;
+    if (!runtime.wakeUpText && !runtime.taxonomyText) return;
 
-    const extra =
-      "\n\n## Agent Memory (ACTIVE)\n" +
-      "You have persistent memory across sessions. Previous conversations and decisions are stored and searchable.\n" +
-      "Use `memory_search` to find past context. Use `memory_save` to explicitly remember something important.\n" +
-      "Use `memory_recall` to browse memories for a specific project or topic.\n" +
-      "Use `memory_graph` to discover cross-project connections via shared topics.\n" +
-      "Use `knowledge_add` to record structured facts. Use `knowledge_query` to query them.\n" +
-      "Use `knowledge_invalidate` to mark facts as no longer true. Use `knowledge_timeline` for chronological history.\n" +
-      "Use `memory_diary_write` to record reflections. Use `memory_diary_read` to review past entries.\n" +
-      "Use `memory_delete` to remove specific memories. Use `memory_check_duplicate` before storing.\n\n" +
-      runtime.wakeUpText;
+    let extra = "";
+
+    if (runtime.wakeUpText) {
+      extra +=
+        "\n\n## Agent Memory (ACTIVE)\n" +
+        "You have persistent memory across sessions. Previous conversations and decisions are stored and searchable.\n" +
+        "Use `memory_search` to find past context. Use `memory_save` to explicitly remember something important.\n" +
+        "Use `memory_recall` to browse memories for a specific project or topic.\n" +
+        "Use `memory_graph` to discover cross-project connections via shared topics.\n" +
+        "Use `knowledge_add` to record structured facts. Use `knowledge_query` to query them.\n" +
+        "Use `knowledge_invalidate` to mark facts as no longer true. Use `knowledge_timeline` for chronological history.\n" +
+        "Use `memory_diary_write` to record reflections. Use `memory_diary_read` to review past entries.\n" +
+        "Use `memory_delete` to remove specific memories. Use `memory_check_duplicate` before storing.\n\n" +
+        runtime.wakeUpText;
+    }
+
+    // Taxonomy: complete map of what projects/topics exist — lets the model
+    // know WHERE to look without having to call memory_taxonomy first.
+    if (runtime.taxonomyText) {
+      extra += "\n\n" + runtime.taxonomyText;
+    }
 
     return {
       systemPrompt: event.systemPrompt + extra,
