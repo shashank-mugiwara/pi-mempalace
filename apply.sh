@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
 #
-# apply.sh — re-apply this forked pi-mempalace extension into pi's runtime.
+# apply.sh — RETIRED.
 #
-# pi loads the extension from the npm-installed package directory. After any
-# `pi` update/reinstall that may overwrite it with the upstream npm version,
-# run this to restore the fork. Reuses the already-built native better-sqlite3
-# in the shared node_modules (no rebuild needed).
+# This fork is now installed directly as a pinned pi git package:
+#   git:github.com/shashank-mugiwara/pi-mempalace@<commit>
+#
+# Do not patch ~/.pi/agent/npm/node_modules/pi-mempalace anymore. That older
+# npm-runtime bridge was removed on 2026-06-28 because it made the installed
+# package source ambiguous and could be silently reverted by package updates.
+#
+# To move pi to a newer fork commit, use:
+#   pi install git:github.com/shashank-mugiwara/pi-mempalace@<new-commit>
 #
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$REPO_DIR/extensions/pi-mempalace"
-DEST="$HOME/.pi/agent/npm/node_modules/pi-mempalace/extensions/pi-mempalace"
+cat >&2 <<'MSG'
+apply.sh is retired.
 
-if [ ! -d "$DEST" ]; then
-  echo "✗ Runtime pi-mempalace not found at:"
-  echo "    $DEST"
-  echo "  Is 'npm:pi-mempalace' still listed in ~/.pi/agent/settings.json packages?"
-  exit 1
-fi
+pi-mempalace is now loaded as a pinned git package, not by patching the npm
+runtime directory. To update the installed fork, run:
 
-cp -v "$SRC/index.ts"        "$DEST/index.ts"
-cp -v "$SRC/memory_store.ts" "$DEST/memory_store.ts"
+  pi install git:github.com/shashank-mugiwara/pi-mempalace@<new-commit>
 
-echo "✓ Applied forked pi-mempalace to runtime. Restart pi to load the changes."
+Then ensure ~/.pi/agent/settings.json contains only that git mempalace source.
+MSG
+
+exit 1
