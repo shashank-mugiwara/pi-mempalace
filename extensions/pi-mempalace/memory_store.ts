@@ -849,7 +849,7 @@ export class MemoryStore {
     const placeholders = rowids.map(() => "?").join(",");
     const memRows = this.db
       .prepare(
-        `SELECT rowid, id, content, project, topic, source, timestamp, importance
+        `SELECT rowid, id, content, project, topic, source, timestamp, importance, chunk_index
          FROM memories WHERE rowid IN (${placeholders})`
       )
       .all(...rowids) as MemoryRow[];
@@ -887,7 +887,35 @@ export class MemoryStore {
         ? (r: SearchResult) => r.similarity
         : (r: SearchResult) => r.similarity * r.importance;
     results.sort((a, b) => scoreOf(b) - scoreOf(a));
-    results = results.slice(0, nResults);
+
+    // Collapse chunk families: chunks of one long memory each carry their own
+    // embedding, so a single memory could occupy several top-N slots as
+    // mid-sentence fragments (live failure 2026-07-07: two fragments of the
+    // same style-lock memory crowded a 5-result search while the actual
+    // answer ranked 6th). Keep only the best-scoring chunk per family.
+    const familyOf = (id: string) => id.replace(/_c\d+$/, "");
+    const seenFamilies = new Set<string>();
+    const deduped: SearchResult[] = [];
+    for (const r of results) {
+      const family = familyOf(r.id);
+      if (seenFamilies.has(family)) continue;
+      seenFamilies.add(family);
+      deduped.push(r);
+    }
+    results = deduped.slice(0, nResults);
+
+    // A continuation chunk starts mid-sentence — prepend the family's opening
+    // so the reader knows WHICH memory the fragment belongs to.
+    const stmtC0 = this.db.prepare(`SELECT content FROM memories WHERE id = ?`);
+    for (const r of results) {
+      if (/_c[1-9]\d*$/.test(r.id)) {
+        const c0 = stmtC0.get(`${familyOf(r.id)}_c0`) as { content: string } | undefined;
+        if (c0) {
+          const head = c0.content.trim().replace(/\s+/g, " ").slice(0, 140);
+          r.text = `⟨${head}…⟩ ${r.text}`;
+        }
+      }
+    }
 
     return { query, filters: { project, topic }, results };
   }
@@ -936,7 +964,12 @@ export class MemoryStore {
       return "\n## Memory — Recent Context\nNo memories stored yet.";
     }
 
-    const whereClause = project ? "WHERE project = ?" : "";
+    // chunk_index = 0 only: continuation chunks inherit their parent's high
+    // importance and would surface as mid-word fragments in the wake identity
+    // context (live failure 2026-07-07: "serted by both pytest..." led L1).
+    const whereClause = project
+      ? "WHERE project = ? AND chunk_index = 0"
+      : "WHERE chunk_index = 0";
     const params = project ? [project] : [];
     const rows = this.db
       .prepare(
@@ -1035,29 +1068,44 @@ export class MemoryStore {
     return { matched: rows.length, deleted: rows.length };
   }
 
-  delete(id: string): { status: string; id: string } {
+  delete(id: string): { status: string; id: string; rows?: number } {
     this.ensureLoaded();
 
     if (!id || !id.trim()) {
       throw new Error("No id provided");
     }
 
-    const row = this.stmtFindById.get(id) as MemoryRow | undefined;
-    if (!row) {
+    // Family-aware: deleting any chunk of a chunked memory removes the whole
+    // family. A stranded continuation chunk is unfindable noise — it has no
+    // c0 context yet still competes in vector search.
+    const family = id.replace(/_c\d+$/, "");
+    // LIKE treats "_" as a single-char wildcard, so re-verify membership in JS
+    // with an exact family pattern before deleting anything.
+    const familyPattern = new RegExp(
+      `^${family.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(_c\\d+)?$`
+    );
+    const rows = (
+      this.db
+        .prepare(`SELECT rowid, id FROM memories WHERE id = ? OR id LIKE ?`)
+        .all(id, `${family}_c%`) as { rowid: number; id: string }[]
+    ).filter((row) => familyPattern.test(row.id));
+    if (rows.length === 0) {
       throw new Error(`Memory not found: ${id}`);
     }
 
     // Delete from both tables in a transaction
     const deleteTransaction = this.db.transaction(() => {
-      this.stmtDeleteVec.run(BigInt(row.rowid));
-      this.stmtDeleteMemory.run(id);
+      for (const row of rows) {
+        this.stmtDeleteVec.run(BigInt(row.rowid));
+        this.stmtDeleteMemory.run(row.id);
+      }
     });
     deleteTransaction();
 
     // Invalidate L1 cache
     this.cachedL1 = null;
 
-    return { status: "deleted", id };
+    return { status: "deleted", id, rows: rows.length };
   }
 
   listProjects(): { projects: Record<string, number>; total: number } {
@@ -1084,8 +1132,10 @@ export class MemoryStore {
     const topic = options?.topic || null;
     const nResults = Math.min(options?.n_results || 10, 50);
 
-    // Build dynamic query
-    const conditions: string[] = [];
+    // Build dynamic query. chunk_index = 0 only — recall is a recency listing,
+    // and continuation chunks would show as duplicate mid-sentence entries of
+    // the same memory.
+    const conditions: string[] = ["chunk_index = 0"];
     const params: any[] = [];
 
     if (project) {
