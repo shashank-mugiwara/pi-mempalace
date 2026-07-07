@@ -1,5 +1,43 @@
 # Fork changelog
 
+## 0.4.0 — 2026-07-07 — auto-recall + always-on memory instructions
+
+### Diagnosis
+
+"Pi sometimes doesn't search memory" had three causes:
+
+1. Retrieval was 100% model-initiated — nothing recalled memory per user
+   message, so recall depended on the model *choosing* to call `memory_search`.
+2. `memory_search`'s prompt guidelines only triggered on "user asks about past
+   decisions", not on starting work that depends on prior sessions.
+3. The whole "Agent Memory (ACTIVE)" instruction block was gated on
+   `wakeUpText` being non-null — an empty wake-up digest (fresh project, or a
+   wake-up error at session start) silently dropped every memory instruction
+   from the system prompt.
+
+### Changes (`extensions/pi-mempalace/index.ts`)
+
+- **Auto-recall (new):** on `before_agent_start`, the user prompt is
+  semantically searched against the store (blended ranking); hits above a
+  similarity floor are injected as a persistent `pi-mempalace-recall` message.
+  - Injected as a *message* (conversation tail), not a system-prompt mutation,
+    so the provider prompt cache stays valid across turns.
+  - Per-session dedupe by memory id — the same memory is never injected twice.
+  - Greedy char budget; fail-open (recall can never block the agent loop).
+  - Config (`~/.pi/agent/memory/config.json`): `autoRecall` (default true),
+    `autoRecallMinSimilarity` (0.5), `autoRecallMaxResults` (4),
+    `autoRecallMaxChars` (2400), `autoRecallMinPromptChars` (15).
+- **Decoupled instructions from wake-up:** the memory instruction block now
+  injects whenever the backend is available; only the digest itself is gated
+  on `wakeUpEnabled` + non-empty `wakeUpText`.
+- **Embedder warm-up:** background dummy search at session start so the first
+  auto-recall doesn't pay the embedding-model load latency.
+- **Broader `memory_search` guidelines:** proactively search when starting
+  work on a known project; auto-recall only covers the latest message.
+- **Taxonomy injection gated + shrunk** (integrates remote `6188790`, applies
+  the 2026-06-28 harness-audit recommendation): new config `taxonomyEnabled`
+  (default true) and `taxonomyMaxChars` (default 2000, was hardcoded 3500).
+
 ## 0.3.1 — 2026-06-28 — direct git-package install compatibility
 
 - Updated extension imports from legacy `@mariozechner/*` package names to current

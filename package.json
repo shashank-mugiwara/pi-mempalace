@@ -1,8 +1,8 @@
 {
   "name": "pi-mempalace",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "type": "module",
-  "description": "Persistent agent memory for pi — raw verbatim storage with semantic search. Fork (Jabbslad lineage) with importance-blended retrieval ranking + safe bulk-prune.",
+  "description": "Persistent agent memory for pi — raw verbatim storage with semantic search. Fork (Jabbslad lineage) with importance-blended retrieval ranking, per-prompt auto-recall + safe bulk-prune.",
   "keywords": [
     "pi-package"
   ],

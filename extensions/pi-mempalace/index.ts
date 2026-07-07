@@ -11,6 +11,8 @@
  * - `memory_status` tool — show memory store overview
  * - Auto-capture of conversation exchanges on session shutdown/compact
  * - Wake-up context injection (L0 identity + L1 top memories) into system prompt
+ * - Auto-recall: each user prompt is semantically matched against the store and
+ *   top hits are injected as a `pi-mempalace-recall` message (config: autoRecall*)
  * - Status widget showing memory count
  * - `/memory` command for quick operations
  */
@@ -64,6 +66,20 @@ interface MemoryConfig {
   wakeUpMaxTokens: number;
   /** Default project name (auto-detected from cwd if not set) */
   defaultProject: string | null;
+  /** Auto-recall: semantically match each user prompt against the store and inject top hits as a message */
+  autoRecall: boolean;
+  /** Minimum similarity (0-1) for an auto-recalled memory */
+  autoRecallMinSimilarity: number;
+  /** Max memories injected per prompt */
+  autoRecallMaxResults: number;
+  /** Max characters of recalled content injected per prompt */
+  autoRecallMaxChars: number;
+  /** Skip auto-recall for prompts shorter than this many characters */
+  autoRecallMinPromptChars: number;
+  /** Inject the project→topic taxonomy index into the system prompt */
+  taxonomyEnabled: boolean;
+  /** Max characters for the injected taxonomy section */
+  taxonomyMaxChars: number;
 }
 
 interface MemoryRuntime {
@@ -85,6 +101,8 @@ interface MemoryRuntime {
   enabled: boolean;
   /** The memory store instance */
   store: MemoryStore;
+  /** Memory ids already auto-recalled this session (avoid re-injecting) */
+  recalledIds: Set<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +113,10 @@ interface MemoryRuntime {
  * Render a compact project → topic(count) index for system-prompt injection.
  * Helps the model know what memory regions exist before it calls memory_search.
  */
-function buildTaxonomySection(taxonomy: TaxonomyNode[]): string | null {
+function buildTaxonomySection(
+  taxonomy: TaxonomyNode[],
+  maxChars: number = MAX_TAXONOMY_CHARS,
+): string | null {
   if (!taxonomy || taxonomy.length === 0) return null;
 
   const lines: string[] = [
@@ -122,7 +143,7 @@ function buildTaxonomySection(taxonomy: TaxonomyNode[]): string | null {
   let truncated = false;
   for (const line of projectLines) {
     const candidate = result + "\n" + line;
-    if (candidate.length > MAX_TAXONOMY_CHARS) {
+    if (candidate.length > maxChars) {
       truncated = true;
       break;
     }
@@ -142,6 +163,13 @@ function defaultConfig(): MemoryConfig {
     wakeUpEnabled: true,
     wakeUpMaxTokens: 800,
     defaultProject: null,
+    autoRecall: true,
+    autoRecallMinSimilarity: 0.5,
+    autoRecallMaxResults: 4,
+    autoRecallMaxChars: 2400,
+    autoRecallMinPromptChars: 15,
+    taxonomyEnabled: true,
+    taxonomyMaxChars: 2000,
   };
 }
 
@@ -156,6 +184,7 @@ function createRuntime(): MemoryRuntime {
     currentProject: "general",
     enabled: true,
     store: new MemoryStore(),
+    recalledIds: new Set(),
   };
 }
 
@@ -416,10 +445,16 @@ export default function memoryExtension(pi: ExtensionAPI) {
       // Pre-compute taxonomy for system-prompt injection (shows all projects/topics).
       try {
         const taxonomy = runtime.store.getTaxonomy();
-        runtime.taxonomyText = buildTaxonomySection(taxonomy);
+        runtime.taxonomyText = buildTaxonomySection(taxonomy, runtime.config.taxonomyMaxChars);
       } catch {
         runtime.taxonomyText = null;
       }
+    }
+
+    // Warm the embedding model in the background so the first auto-recall
+    // doesn't add model-load latency to the first prompt.
+    if (runtime.config.autoRecall && runtime.backendAvailable) {
+      void runtime.store.search("session warmup", { n_results: 1 }).catch(() => {});
     }
   };
 
@@ -495,37 +530,82 @@ export default function memoryExtension(pi: ExtensionAPI) {
     }
   });
 
-  // Inject wake-up context + taxonomy index into system prompt
+  // Inject memory instructions + wake-up digest + taxonomy index into the
+  // system prompt (all stable per session, so the provider prompt cache stays
+  // valid across turns), and auto-recalled memories as a per-prompt message
+  // (appended at the tail of the conversation, which also keeps the cache valid).
   pi.on("before_agent_start", async (event, ctx) => {
     const runtime = getRuntime(ctx);
-    if (!runtime.enabled || !runtime.config.wakeUpEnabled) return;
-    if (!runtime.wakeUpText && !runtime.taxonomyText) return;
+    if (!runtime.enabled || !runtime.backendAvailable) return;
 
-    let extra = "";
-
-    if (runtime.wakeUpText) {
-      extra +=
-        "\n\n## Agent Memory (ACTIVE)\n" +
-        "You have persistent memory across sessions. Previous conversations and decisions are stored and searchable.\n" +
-        "Use `memory_search` to find past context. Use `memory_save` to explicitly remember something important.\n" +
-        "Use `memory_recall` to browse memories for a specific project or topic.\n" +
-        "Use `memory_graph` to discover cross-project connections via shared topics.\n" +
-        "Use `knowledge_add` to record structured facts. Use `knowledge_query` to query them.\n" +
-        "Use `knowledge_invalidate` to mark facts as no longer true. Use `knowledge_timeline` for chronological history.\n" +
-        "Use `memory_diary_write` to record reflections. Use `memory_diary_read` to review past entries.\n" +
-        "Use `memory_delete` to remove specific memories. Use `memory_check_duplicate` before storing.\n\n" +
-        runtime.wakeUpText;
+    // The instruction block is deliberately NOT gated on wakeUpText: an empty
+    // digest (fresh project, wake-up error) must not silently drop the memory
+    // tool guidance from the prompt.
+    let extra =
+      "\n\n## Agent Memory (ACTIVE)\n" +
+      "You have persistent memory across sessions. Previous conversations and decisions are stored and searchable.\n" +
+      "Use `memory_search` to find past context. Use `memory_save` to explicitly remember something important.\n" +
+      "Use `memory_recall` to browse memories for a specific project or topic.\n" +
+      "Use `memory_graph` to discover cross-project connections via shared topics.\n" +
+      "Use `knowledge_add` to record structured facts. Use `knowledge_query` to query them.\n" +
+      "Use `knowledge_invalidate` to mark facts as no longer true. Use `knowledge_timeline` for chronological history.\n" +
+      "Use `memory_diary_write` to record reflections. Use `memory_diary_read` to review past entries.\n" +
+      "Use `memory_delete` to remove specific memories. Use `memory_check_duplicate` before storing.\n";
+    if (runtime.config.wakeUpEnabled && runtime.wakeUpText) {
+      extra += "\n" + runtime.wakeUpText;
     }
 
-    // Taxonomy: complete map of what projects/topics exist — lets the model
+    // Taxonomy: compact map of what projects/topics exist — lets the model
     // know WHERE to look without having to call memory_taxonomy first.
-    if (runtime.taxonomyText) {
+    if (runtime.config.taxonomyEnabled && runtime.taxonomyText) {
       extra += "\n\n" + runtime.taxonomyText;
     }
 
-    return {
-      systemPrompt: event.systemPrompt + extra,
-    };
+    const result: {
+      systemPrompt: string;
+      message?: { customType: string; content: string; display: boolean };
+    } = { systemPrompt: event.systemPrompt + extra };
+
+    // Auto-recall: retrieval must not depend on the model deciding to search.
+    if (runtime.config.autoRecall) {
+      const query = (event.prompt || "").trim();
+      if (query.length >= runtime.config.autoRecallMinPromptChars) {
+        try {
+          const res = await runtime.store.search(query.slice(0, 2000), {
+            n_results: Math.max(runtime.config.autoRecallMaxResults * 2, 8),
+          });
+          const picked: typeof res.results = [];
+          let budget = runtime.config.autoRecallMaxChars;
+          for (const hit of res.results) {
+            if (hit.similarity < runtime.config.autoRecallMinSimilarity) continue;
+            if (runtime.recalledIds.has(hit.id)) continue;
+            if (hit.text.length > budget) continue;
+            picked.push(hit);
+            budget -= hit.text.length;
+            if (picked.length >= runtime.config.autoRecallMaxResults) break;
+          }
+          if (picked.length > 0) {
+            for (const hit of picked) runtime.recalledIds.add(hit.id);
+            const lines = picked.map(
+              (hit) =>
+                `- [${hit.project}/${hit.topic}] (${(hit.similarity * 100).toFixed(0)}% match, ${hit.timestamp.slice(0, 10)})\n  ${hit.text.replace(/\n/g, "\n  ")}`
+            );
+            result.message = {
+              customType: "pi-mempalace-recall",
+              content:
+                "Auto-recalled memories relevant to the latest user message (from the shared memory palace; they reflect what was true when saved — verify against the current code/config before relying on them):\n\n" +
+                lines.join("\n\n") +
+                "\n\nUse `memory_search` if you need deeper or differently-angled context.",
+              display: true,
+            };
+          }
+        } catch {
+          // Fail-open: recall must never block or break the agent loop.
+        }
+      }
+    }
+
+    return result;
   });
 
   // -----------------------------------------------------------------------
@@ -541,6 +621,8 @@ export default function memoryExtension(pi: ExtensionAPI) {
     promptSnippet: "memory_search(query, project?, topic?, n_results?) — semantic search across stored memories",
     promptGuidelines: [
       "Use when the user asks about past decisions, previous conversations, or 'what did we decide about X'",
+      "Proactively search when starting work on a known project, or when a task likely depends on prior sessions — don't wait for the user to mention the past",
+      "Auto-recalled context (the pi-mempalace-recall message) covers only the latest user message; search yourself for deeper or adjacent context",
       "Filter by project to narrow results to a specific codebase",
       "Returns ranked results with similarity scores — higher is more relevant",
     ],
