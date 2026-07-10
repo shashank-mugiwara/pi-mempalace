@@ -3,8 +3,10 @@
 Persistent agent memory for **pi** — raw verbatim storage with semantic search,
 a knowledge graph, palace tunnels, and a diary. This is a **fork of the
 [Jabbslad/pi-mempalace](https://github.com/Jabbslad/pi-mempalace) lineage**
-(SQLite + sqlite-vec backend, single `~/.pi/agent/memory/memories.db`), patched
-to fix a retrieval-pollution problem.
+(SQLite + sqlite-vec backend, single store at `~/.pi/agent/memory/memories.db`
+or `$MEMPALACE_HOME`), patched to fix a retrieval-pollution problem and since
+grown: per-prompt auto-recall (0.4.0) and a standalone CLI that runs the same
+engine without pi (0.5.0).
 
 > ⚠️ This is **not** the SurrealDB-based `@sinamtz/pi-mempalace` rewrite. That
 > code is preserved on the [`sinamtz-upstream`](../../tree/sinamtz-upstream)
@@ -21,28 +23,58 @@ demoted it. See [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md) for the full diagnosi
 
 ## What changed vs upstream v0.2.0
 
-All changes are in `extensions/pi-mempalace/`:
+Full diagnosis and detail per release in [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md).
 
-1. **Importance-blended search ranking** (`memory_store.ts` → `search()`).
-   Results are now ranked by `similarity × importance` instead of raw vector
-   distance. Low-value memories (0.5) sink below curated ones (0.8+).
-   - Nothing is excluded — everything stays searchable, the noise just stops
-     winning. A `rank: "blended" | "similarity"` option is added; `"blended"`
-     is the default, `"similarity"` is used internally by duplicate detection.
-   - Search now always over-fetches a candidate pool (`max(n×10, 50)`) so the
-     blend can actually re-order, then trims to `n`.
-   - The true cosine `similarity` is still returned/displayed; only the
-     ordering changes. `importance` is now included in each `SearchResult` and
-     shown in the tool output (`… % match · imp 0.85 …`).
+- **0.3.0 — retrieval-pollution fix.** `search()` ranks by
+  `similarity × importance` instead of raw vector distance, over a candidate
+  pool of `max(n×10, 50)`, so low-value memories (0.5 auto-capture) sink below
+  curated ones (0.8+) without being excluded. `rank: "blended" | "similarity"`
+  option (`"similarity"` used internally by duplicate detection); `importance`
+  surfaced in results (`… % match · imp 0.85 …`). Plus `pruneBySource()` —
+  safe bulk delete from both `memories` and the `vec0` index in one
+  transaction (admin method, not an agent tool).
+- **0.4.0 — auto-recall.** Each user prompt is semantically matched against
+  the store on `before_agent_start`; hits above a similarity floor inject as a
+  `pi-mempalace-recall` message (prompt-cache-friendly, per-session dedupe,
+  fail-open). Memory instructions no longer silently drop when the wake-up
+  digest is empty; taxonomy injection gated and shrunk; embedder warm-up at
+  session start.
+- **0.5.0 — standalone CLI + audit fixes.** `cli/mempalace.mjs` joins the repo
+  as a thin wrapper over `MemoryStore` (Node ≥ 22.18 type-stripping) — same
+  ranking/dedupe/chunking as the extension, no pi required, bootstraps a fresh
+  store, adds `forget <id>`. `MEMPALACE_HOME` relocates the store. Audit
+  fixes: `autoCapture` defaults **false**; `busy_timeout=5000` for
+  multi-agent WAL concurrency; family-scoped chunk hashes (c0-orphan fix);
+  concurrent duplicate saves return `duplicate` instead of throwing; KG
+  temporal dates normalized to local `YYYY-MM-DD` (boundary-day fix);
+  filtered search widens its pool instead of starving; `addEntity` stops
+  clobbering `entity_type`/`properties`.
 
-2. **Safe bulk-prune** (`memory_store.ts` → `pruneBySource()`). Deletes from
-   **both** the `memories` table and the `vec_memories` vector index in one
-   transaction, so no orphaned vectors are left behind (the raw `sqlite3` CLI
-   cannot clean the `vec0` index). Supports `{ dryRun: true }`. Not exposed as
-   an agent tool — it is an admin/maintenance method.
+Everything else (tools, knowledge graph, diary, tunnels, wake-up) is unchanged
+from upstream.
 
-Everything else (tools, knowledge graph, diary, tunnels, wake-up, auto-capture
-hook) is unchanged from upstream.
+## Standalone use (no pi)
+
+The CLI drives the same engine and store without a pi installation:
+
+```bash
+git clone https://github.com/shashank-mugiwara/pi-mempalace && cd pi-mempalace
+npm install --omit=dev --omit=peer     # just better-sqlite3, sqlite-vec, transformers
+
+# optional: relocate the store (default ~/.pi/agent/memory)
+export MEMPALACE_HOME=/path/to/memory
+
+node cli/mempalace.mjs save "content" --project p --topic t --importance 0.8 --source note.md
+node cli/mempalace.mjs search "natural language query" --project p -n 5 --json
+node cli/mempalace.mjs kg-add "subject" "predicate" "object" --from 2026-01-01
+node cli/mempalace.mjs kg-query "subject" --at 2026-06-01
+node cli/mempalace.mjs forget mem_<id>
+node cli/mempalace.mjs status
+```
+
+Requires Node ≥ 22.18. First embedding call downloads the ~90 MB
+`all-MiniLM-L6-v2` model once; everything is local thereafter. A missing
+database is created with the full schema on first use.
 
 ## Validated impact
 
@@ -77,10 +109,11 @@ Example settings entry:
 
 ## Memory is model-managed
 
-Auto-capture is **off** (`~/.pi/agent/memory/config.json` → `autoCapture:false`).
-The model saves what matters via `memory_save` / `knowledge_add` /
-`memory_diary_write`; a separate `memory-summarizer` extension is the backstop.
-This fork's ranking change keeps any residual low-value rows from surfacing.
+Auto-capture is **off — and since 0.5.0, off by default** (a fresh install
+with no `config.json` no longer silently re-enables it). The model saves what
+matters via `memory_save` / `knowledge_add` / `memory_diary_write`; a separate
+`memory-summarizer` extension is the backstop. This fork's ranking change
+keeps any residual low-value rows from surfacing.
 
 ---
 
