@@ -1,5 +1,73 @@
 # Fork changelog
 
+## 0.5.0 — 2026-07-10 — standalone CLI, relocatable store, audit fixes
+
+Prompted by deploying the palace on a second machine (no pi installed) and a
+code audit of v0.4.0. Two themes: portability, and correctness bugs the audit
+surfaced.
+
+### New: `cli/mempalace.mjs` — the CLI now lives in the repo
+
+The previous CLI (`~/.pi/agent/memory/cli/mempalace.mjs`) was a hand-written
+re-implementation outside the repo. It had already drifted: pure-similarity
+ranking (pre-0.3.0), no chunk-family dedupe, and `LIMIT n` fetches that made
+re-ranking impossible — CLI users got the exact retrieval pollution 0.3.0
+fixed, against the same DB. The new CLI is a thin wrapper that imports
+`MemoryStore` from `memory_store.ts` directly (Node ≥ 22.18 native
+type-stripping), so CLI semantics are the engine's semantics, permanently.
+
+- Commands: `search`, `save`, `recall`, `status`, `projects`, `kg-add`,
+  `kg-query`, plus new **`forget <id>`** (family-aware delete via
+  `MemoryStore.delete`).
+- Bootstraps a fresh store: `MemoryStore.load()` creates the directory and
+  full schema when `memories.db` is absent (the old CLI refused to start).
+- Needs only the three runtime deps — install with
+  `npm install --omit=dev --omit=peer` to skip the pi runtime packages.
+
+### New: `MEMPALACE_HOME` — relocatable store
+
+`memory_store.ts` and `index.ts` resolve the memory directory from
+`$MEMPALACE_HOME` when set (fallback unchanged: `~/.pi/agent/memory`). Lets a
+deployment keep DB + identity + config next to a project instead of ~/.pi.
+
+### Fixed (audit findings)
+
+- **`autoCapture` now defaults to `false`** (`index.ts defaultConfig`). A
+  fresh install with no `config.json` used to silently re-enable the exact
+  0.5-importance capture noise that 0.3.0 existed to clean up.
+- **`busy_timeout = 5000` in `MemoryStore.load()`**: several agents share one
+  WAL DB; concurrent writes used to throw `SQLITE_BUSY` instantly.
+- **Chunk-family orphans**: chunk `content_hash` is now scoped by family+index
+  (`contentHash(`${baseHash}_c${i}\n${chunk}`)`). Previously a chunk
+  byte-identical to one from a *different* memory was skipped by the global
+  UNIQUE hash; if that chunk was c0, the whole family vanished from recall,
+  wakeup, and search's c0-prefix (all filter `chunk_index = 0`). Same-content
+  re-saves still dedupe via the chunk-id check.
+- **Single-chunk `store()` race**: the insert is now wrapped in try/catch —
+  two agents saving identical content concurrently gets `{status:"duplicate"}`
+  instead of a user-visible UNIQUE-violation error (matches the multi-chunk
+  path).
+- **KG temporal dates normalized to `YYYY-MM-DD`** (`toKgDate`): `valid_from`
+  / `valid_to` / `at_time` are compared lexicographically, and mixing
+  date-only with full-ISO values broke boundary days ("2025-06-01" >=
+  "2025-06-01T12:00:00Z" is false — a fact wrongly excluded on its last valid
+  day). Defaults that meant "today" now use **local** time (`localToday()`),
+  not UTC (off by a day east of GMT).
+- **Filtered search under-return**: project/topic filtering happens after the
+  ANN fetch; if a small project's memories sat outside the global top-50 by
+  distance, a filtered search returned nothing despite matches. The candidate
+  pool now widens once (to 2000) when a filtered search starves.
+- **`addEntity` no longer clobbers** `entity_type`/`properties` with
+  "unknown"/"{}" on update when the caller doesn't supply them (every
+  `addTriple` auto-create used to reset them).
+- **Home-dir fallback**: literal `"~"` path fallback replaced with
+  `os.homedir()`.
+
+### Packaging
+
+- `package.json`: version 0.5.0, `engines.node >= 22.18`, `cli/` shipped in
+  `files`, `package-lock.json` committed for reproducible installs.
+
 ## 0.4.0 — 2026-07-07 — auto-recall + always-on memory instructions
 
 ### Diagnosis

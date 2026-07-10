@@ -22,6 +22,7 @@
 
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 // @ts-ignore — better-sqlite3 types may not be perfect
@@ -33,12 +34,11 @@ import * as sqliteVec from "sqlite-vec";
 // Constants
 // ---------------------------------------------------------------------------
 
-const MEMORY_DIR = path.join(
-  process.env.HOME || process.env.USERPROFILE || "~",
-  ".pi",
-  "agent",
-  "memory"
-);
+// MEMPALACE_HOME relocates the whole store (DB, identity, config) — used by
+// standalone deployments that keep memory next to a project instead of ~/.pi.
+const MEMORY_DIR =
+  process.env.MEMPALACE_HOME ||
+  path.join(os.homedir(), ".pi", "agent", "memory");
 const MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
 const EMBEDDING_DIM = 384;
 
@@ -366,6 +366,31 @@ function distanceToSimilarity(distance: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Knowledge-graph temporal dates
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical form for KG temporal values: date-only YYYY-MM-DD.
+ * valid_from / valid_to / at_time are compared lexicographically, so mixing a
+ * date-only value with a full ISO timestamp breaks boundary days
+ * ("2025-06-01" >= "2025-06-01T12:00:00Z" is false). Facts are day-granular;
+ * strip everything past the date.
+ */
+function toKgDate(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const m = String(value).match(/^\d{4}-\d{2}-\d{2}/);
+  return m ? m[0] : String(value);
+}
+
+/** Today as a LOCAL date (UTC "today" is off by a day for east-of-GMT users). */
+export function localToday(): string {
+  const d = new Date();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+// ---------------------------------------------------------------------------
 // MemoryStore
 // ---------------------------------------------------------------------------
 
@@ -417,6 +442,10 @@ export class MemoryStore {
 
     // WAL mode for better concurrent read performance
     this.db.pragma("journal_mode = WAL");
+    // Multiple agents (pi, Claude Code, Codex, the CLI) share this DB; WAL
+    // allows one writer at a time, so wait for a lock instead of throwing
+    // SQLITE_BUSY the instant two writes overlap.
+    this.db.pragma("busy_timeout = 5000");
 
     // Create schema
     this.db.exec(`
@@ -699,20 +728,29 @@ export class MemoryStore {
 
       const vec = await embed(content);
 
-      this.insertMemoryAndVec(
-        docId,
-        content,
-        cHash,
-        project,
-        topic,
-        source,
-        timestamp,
-        sessionId,
-        importance,
-        vec,
-        0,    // chunk_index
-        null  // parent_id
-      );
+      // Concurrent agents can pass the hash check simultaneously — treat the
+      // resulting UNIQUE violation as a duplicate, matching the multi-chunk path.
+      try {
+        this.insertMemoryAndVec(
+          docId,
+          content,
+          cHash,
+          project,
+          topic,
+          source,
+          timestamp,
+          sessionId,
+          importance,
+          vec,
+          0,    // chunk_index
+          null  // parent_id
+        );
+      } catch (e: any) {
+        if (String(e?.message).includes("UNIQUE")) {
+          return { status: "duplicate", id: docId };
+        }
+        throw e;
+      }
 
       // Invalidate L1 cache when new memory is stored
       this.cachedL1 = null;
@@ -727,11 +765,20 @@ export class MemoryStore {
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
-      const chunkHash = contentHash(chunk);
+      // Scope the chunk hash by family + index: content_hash is globally
+      // UNIQUE, so a raw contentHash(chunk) collides when two different
+      // memories share a byte-identical chunk (boilerplate, headings). If the
+      // colliding chunk is c0, the whole family becomes an orphan — recall,
+      // wakeup and search's c0-prefix all filter on chunk_index 0 and never
+      // surface it again. Family-scoping makes cross-family collisions
+      // impossible; same-content re-saves still dedupe via the id check below.
+      const chunkHash = contentHash(`${baseHash}_c${i}\n${chunk}`);
       const chunkId = `mem_${baseHash}_c${i}`;
 
-      // Skip duplicate chunks
-      if (this.stmtFindByHash.get(chunkHash)) continue;
+      // Skip chunks this exact memory already stored (id check also covers
+      // rows written before family-scoped hashing).
+      if (this.stmtHasId.get(chunkId) || this.stmtFindByHash.get(chunkHash))
+        continue;
 
       const vec = await embed(chunk);
 
@@ -826,58 +873,78 @@ export class MemoryStore {
     // Always over-fetch a candidate pool (not just the nearest nResults) so the
     // importance blend can actually re-order results — otherwise a high-value
     // memory that is the 12th-nearest by distance could never surface.
-    const searchLimit = Math.max(nResults * 10, 50);
+    let searchLimit = Math.max(nResults * 10, 50);
 
-    const vecRows = this.db
-      .prepare(
-        `SELECT rowid, distance FROM vec_memories
-         WHERE embedding MATCH ?
-         ORDER BY distance
-         LIMIT ?`
-      )
-      .all(queryVec, searchLimit) as VecSearchRow[];
+    // Fetch a candidate pool and post-filter by metadata in JS. Filters and
+    // build results: we keep the true cosine similarity for display, but rank
+    // by a blended score = similarity × importance so that low-value memories
+    // (0.5 auto-capture) sink below curated ones (0.8+) instead of competing
+    // on raw vector distance alone. Nothing is excluded — everything stays
+    // searchable, the noise just stops winning.
+    const fetchCandidates = (limit: number): { pool: number; results: SearchResult[] } => {
+      const vecRows = this.db
+        .prepare(
+          `SELECT rowid, distance FROM vec_memories
+           WHERE embedding MATCH ?
+           ORDER BY distance
+           LIMIT ?`
+        )
+        .all(queryVec, limit) as VecSearchRow[];
 
-    if (vecRows.length === 0) {
-      return { query, filters: { project, topic }, results: [] };
+      if (vecRows.length === 0) return { pool: 0, results: [] };
+
+      // Fetch metadata for matched rowids
+      const rowids = vecRows.map((r) => r.rowid);
+      const distanceMap = new Map(vecRows.map((r) => [r.rowid, r.distance]));
+
+      // Build IN clause — parameterized via individual placeholders
+      const placeholders = rowids.map(() => "?").join(",");
+      const memRows = this.db
+        .prepare(
+          `SELECT rowid, id, content, project, topic, source, timestamp, importance, chunk_index
+           FROM memories WHERE rowid IN (${placeholders})`
+        )
+        .all(...rowids) as MemoryRow[];
+
+      const out: SearchResult[] = [];
+      for (const row of memRows) {
+        if (project && row.project !== project) continue;
+        if (topic && row.topic !== topic) continue;
+
+        const distance = distanceMap.get(row.rowid) ?? Infinity;
+        const similarity = distanceToSimilarity(distance);
+        const importance = row.importance ?? 0.5;
+
+        out.push({
+          id: row.id,
+          text: row.content,
+          project: row.project,
+          topic: row.topic,
+          source: row.source,
+          timestamp: row.timestamp,
+          similarity: Math.round(similarity * 10000) / 10000,
+          importance,
+        });
+      }
+      return { pool: vecRows.length, results: out };
+    };
+
+    let { pool, results } = fetchCandidates(searchLimit);
+
+    // Filtered searches can starve: the filter runs AFTER the ANN fetch, so if
+    // a project's memories sit outside the global top-`searchLimit` by
+    // distance, matches exist but never enter the pool. Widen once.
+    if (
+      (project || topic) &&
+      results.length < nResults &&
+      pool === searchLimit
+    ) {
+      searchLimit = Math.max(searchLimit, 2000);
+      ({ pool, results } = fetchCandidates(searchLimit));
     }
 
-    // Fetch metadata for matched rowids
-    const rowids = vecRows.map((r) => r.rowid);
-    const distanceMap = new Map(vecRows.map((r) => [r.rowid, r.distance]));
-
-    // Build IN clause — parameterized via individual placeholders
-    const placeholders = rowids.map(() => "?").join(",");
-    const memRows = this.db
-      .prepare(
-        `SELECT rowid, id, content, project, topic, source, timestamp, importance, chunk_index
-         FROM memories WHERE rowid IN (${placeholders})`
-      )
-      .all(...rowids) as MemoryRow[];
-
-    // Apply post-filters and build results. We keep the true cosine similarity
-    // for display, but rank by a blended score = similarity × importance so that
-    // low-value memories (0.5 auto-capture) sink below curated ones (0.8+)
-    // instead of competing on raw vector distance alone. Nothing is excluded —
-    // everything stays searchable, the noise just stops winning.
-    let results: SearchResult[] = [];
-    for (const row of memRows) {
-      if (project && row.project !== project) continue;
-      if (topic && row.topic !== topic) continue;
-
-      const distance = distanceMap.get(row.rowid) ?? Infinity;
-      const similarity = distanceToSimilarity(distance);
-      const importance = row.importance ?? 0.5;
-
-      results.push({
-        id: row.id,
-        text: row.content,
-        project: row.project,
-        topic: row.topic,
-        source: row.source,
-        timestamp: row.timestamp,
-        similarity: Math.round(similarity * 10000) / 10000,
-        importance,
-      });
+    if (results.length === 0 && pool === 0) {
+      return { query, filters: { project, topic }, results: [] };
     }
 
     // Rank: blended (similarity × importance) by default, or pure similarity
@@ -1398,14 +1465,19 @@ export class MemoryStore {
       .get(id) as { id: string } | undefined;
 
     if (existing) {
+      // Preserve existing type/properties unless the caller supplies new ones —
+      // addTriple auto-creates bare entities and must not clobber typed ones.
       this.db
         .prepare(
-          `UPDATE entities SET name = ?, entity_type = ?, properties = ? WHERE id = ?`
+          `UPDATE entities SET name = ?,
+             entity_type = COALESCE(?, entity_type),
+             properties = COALESCE(?, properties)
+           WHERE id = ?`
         )
         .run(
           input.name,
-          input.entity_type || "unknown",
-          JSON.stringify(input.properties || {}),
+          input.entity_type ?? null,
+          input.properties ? JSON.stringify(input.properties) : null,
           id
         );
       return { status: "updated", id };
@@ -1455,8 +1527,8 @@ export class MemoryStore {
         subjectId,
         input.predicate,
         objectId,
-        input.valid_from || null,
-        input.valid_to || null,
+        toKgDate(input.valid_from),
+        toKgDate(input.valid_to),
         input.confidence ?? 1.0,
         input.source_memory_id || null,
         input.project || "general",
@@ -1495,9 +1567,10 @@ export class MemoryStore {
     const params: any[] = [entityId, entityId];
 
     if (options?.at_time) {
+      const at = toKgDate(options.at_time);
       query += ` AND (t.valid_from IS NULL OR t.valid_from <= ?)
                  AND (t.valid_to IS NULL OR t.valid_to >= ?)`;
-      params.push(options.at_time, options.at_time);
+      params.push(at, at);
     }
 
     if (options?.project) {
@@ -1551,9 +1624,10 @@ export class MemoryStore {
     const params: any[] = [predicate];
 
     if (options?.at_time) {
+      const at = toKgDate(options.at_time);
       query += ` AND (t.valid_from IS NULL OR t.valid_from <= ?)
                  AND (t.valid_to IS NULL OR t.valid_to >= ?)`;
-      params.push(options.at_time, options.at_time);
+      params.push(at, at);
     }
 
     if (options?.project) {
@@ -1583,7 +1657,7 @@ export class MemoryStore {
     this.ensureLoaded();
     this.db
       .prepare(`UPDATE triples SET valid_to = ? WHERE id = ?`)
-      .run(valid_to || new Date().toISOString(), tripleId);
+      .run(toKgDate(valid_to) || localToday(), tripleId);
   }
 
   /**

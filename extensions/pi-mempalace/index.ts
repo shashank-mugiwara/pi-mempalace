@@ -26,20 +26,19 @@ import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import type { MemoryStats, TaxonomyNode } from "./memory_store.js";
 import { Type } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
-import { MemoryStore } from "./memory_store.js";
+import { localToday, MemoryStore } from "./memory_store.js";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const MEMORY_DIR = path.join(
-  process.env.HOME || process.env.USERPROFILE || "~",
-  ".pi",
-  "agent",
-  "memory"
-);
+// MEMPALACE_HOME relocates the whole store — must match memory_store.ts.
+const MEMORY_DIR =
+  process.env.MEMPALACE_HOME ||
+  path.join(os.homedir(), ".pi", "agent", "memory");
 const CONFIG_PATH = path.join(MEMORY_DIR, "config.json");
 
 // ---------------------------------------------------------------------------
@@ -159,7 +158,10 @@ function buildTaxonomySection(
 
 function defaultConfig(): MemoryConfig {
   return {
-    autoCapture: true,
+    // OFF by default. Auto-capture at importance 0.5 is what polluted the
+    // store this fork exists to fix (4,585 of 5,527 rows were noise) — a
+    // fresh install with no config.json must not silently re-enable it.
+    autoCapture: false,
     wakeUpEnabled: true,
     wakeUpMaxTokens: 800,
     defaultProject: null,
@@ -1292,7 +1294,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
             { status: "not_found" }
           );
         }
-        const endDate = params.ended || new Date().toISOString().slice(0, 10);
+        const endDate = params.ended || localToday();
         runtime.store.invalidateTriple(tripleId, endDate);
         return textResult(
           `\u2705 Invalidated: **${params.subject}** ${params.predicate} **${params.object}** (ended ${endDate})`,
