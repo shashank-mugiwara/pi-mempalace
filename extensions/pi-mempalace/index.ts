@@ -25,11 +25,20 @@ import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import type { MemoryStats, TaxonomyNode } from "./memory_store.js";
 import { Type } from "@earendil-works/pi-ai";
+// `complete` isn't re-exported from the bare "@earendil-works/pi-ai" entry
+// in this repo's installed version — memory-summarizer.ts's import from the
+// main package doesn't resolve against this devDependency, so pull it from
+// the "/compat" subpath where it's actually declared (same function, same
+// call pattern: complete(model, context, options)).
+import { complete } from "@earendil-works/pi-ai/compat";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
 import { localToday, MemoryStore } from "./memory_store.js";
+import { selectRecall, type GateJudgeInput, type RecallGateOptions } from "./recall.ts";
+import { warmReranker } from "./reranker.ts";
+import { buildGatePrompt, parseGateResponse, type GateSkillInput, type GateVerdict } from "./gate.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -51,6 +60,10 @@ const MAX_TAXONOMY_CHARS = 3500;
 const MAX_TOPICS_PER_PROJECT = 5;
 /** Skip projects with fewer memories than this — reduces noise from one-off projects. */
 const MIN_PROJECT_MEMORIES = 5;
+/** Where skill packs live — scanned for the gate's skill-suggestion feature. */
+const SKILLS_DIR = path.join(os.homedir(), ".pi", "agent", "skills");
+/** Truncate a skill's frontmatter description to this many chars before offering it to the gate. */
+const MAX_SKILL_DESCRIPTION_CHARS = 200;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,10 +88,38 @@ interface MemoryConfig {
   autoRecallMaxChars: number;
   /** Skip auto-recall for prompts shorter than this many characters */
   autoRecallMinPromptChars: number;
+  /** n_results passed to store.search() when reranking is on (wider pool than legacy) */
+  autoRecallCandidates: number;
+  /** Candidates below this bi-encoder similarity are dropped before reranking */
+  autoRecallCandidateFloor: number;
+  /** Lower bi-encoder floor applied instead of autoRecallCandidateFloor when the candidate's project matches the current project (same-project candidates get a fairer shot at the cross-encoder) */
+  autoRecallCandidateFloorSameProject: number;
+  /** Penalty subtracted from a hit's score when its project doesn't match the current project */
+  autoRecallCrossProjectPenalty: number;
+  /** Use the cross-encoder reranker as the relevance gate (falls back to the legacy similarity-only path on failure) */
+  autoRecallRerank: boolean;
+  /** Minimum cross-encoder score (post cross-project-penalty) for a reranked candidate to be picked */
+  autoRecallRerankMinScore: number;
   /** Inject the project→topic taxonomy index into the system prompt */
   taxonomyEnabled: boolean;
   /** Max characters for the injected taxonomy section */
   taxonomyMaxChars: number;
+  /** Send gray-zone reranked candidates to an LLM relevance gate before injecting them (falls open to the plain rerankMinScore rule on any gate failure) */
+  autoRecallLlmGate: boolean;
+  /** Provider for the LLM relevance gate (resolved via ctx.modelRegistry, same as memory-summarizer.ts) */
+  autoRecallGateProvider: string;
+  /** Model id for the LLM relevance gate */
+  autoRecallGateModel: string;
+  /** Hard timeout (ms) for the gate model call — abort and fail open past this */
+  autoRecallGateTimeoutMs: number;
+  /** Candidates with finalScore >= this skip the gate entirely (auto-approved) */
+  autoRecallGateAutoApprove: number;
+  /** Candidates with finalScore below this are auto-rejected and never sent to the gate */
+  autoRecallGateMinScore: number;
+  /** Max gray-zone candidates sent to the gate in one call */
+  autoRecallGateMaxCandidates: number;
+  /** Ask the gate to also suggest up to 2 applicable skills from ~/.pi/agent/skills */
+  autoRecallGateSuggestSkills: boolean;
 }
 
 interface MemoryRuntime {
@@ -102,6 +143,8 @@ interface MemoryRuntime {
   store: MemoryStore;
   /** Memory ids already auto-recalled this session (avoid re-injecting) */
   recalledIds: Set<string>;
+  /** Cached skills catalog (name + first-200-chars description) for the LLM gate's skill-suggestion feature, refreshed on session_start when autoRecallGateSuggestSkills is on. */
+  skillsCatalog: GateSkillInput[] | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +196,48 @@ function buildTaxonomySection(
 }
 
 // ---------------------------------------------------------------------------
+// Skills catalog (LLM gate skill-suggestion feature)
+// ---------------------------------------------------------------------------
+
+/**
+ * Scan each `SKILL.md` under SKILLS_DIR (one subdirectory per skill) for
+ * frontmatter `name:` and `description:`, truncating descriptions to
+ * MAX_SKILL_DESCRIPTION_CHARS. Best-effort: missing/unreadable/malformed
+ * files are silently skipped, a missing skills dir yields an empty catalog.
+ * Never throws.
+ */
+function scanSkillsCatalog(): GateSkillInput[] {
+  const out: GateSkillInput[] = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(SKILLS_DIR, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const skillPath = path.join(SKILLS_DIR, entry.name, "SKILL.md");
+    try {
+      const raw = fs.readFileSync(skillPath, "utf-8");
+      const frontmatter = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      if (!frontmatter) continue;
+      const fm = frontmatter[1];
+      const nameMatch = fm.match(/^name:\s*(.+?)\s*$/m);
+      const descMatch = fm.match(/^description:\s*(.+?)\s*$/m);
+      if (!nameMatch || !descMatch) continue;
+      out.push({
+        name: nameMatch[1].trim(),
+        description: descMatch[1].trim().slice(0, MAX_SKILL_DESCRIPTION_CHARS),
+      });
+    } catch {
+      // Skip unreadable/malformed skill — best-effort catalog.
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
 
@@ -169,9 +254,28 @@ function defaultConfig(): MemoryConfig {
     autoRecallMinSimilarity: 0.5,
     autoRecallMaxResults: 4,
     autoRecallMaxChars: 2400,
-    autoRecallMinPromptChars: 15,
+    autoRecallMinPromptChars: 30,
+    autoRecallCandidates: 24,
+    autoRecallCandidateFloor: 0.45,
+    // bench q13 — a same-project relevant memory at sim 0.386 never reached
+    // the cross-encoder under the 0.45 floor. Same-project candidates get a
+    // lower floor since a cross-project penalty already suppresses noise
+    // from other projects; cross-project candidates keep autoRecallCandidateFloor.
+    autoRecallCandidateFloorSameProject: 0.35,
+    autoRecallCrossProjectPenalty: 0.08,
+    autoRecallRerank: true,
+    // tuned from bench v2-rerank — ce scores are bimodal, relevant 0.65+, junk <0.02.
+    autoRecallRerankMinScore: 0.40,
     taxonomyEnabled: true,
     taxonomyMaxChars: 2000,
+    autoRecallLlmGate: true,
+    autoRecallGateProvider: "anthropic",
+    autoRecallGateModel: "claude-haiku-4-5",
+    autoRecallGateTimeoutMs: 2500,
+    autoRecallGateAutoApprove: 0.85,
+    autoRecallGateMinScore: 0.15,
+    autoRecallGateMaxCandidates: 10,
+    autoRecallGateSuggestSkills: true,
   };
 }
 
@@ -187,6 +291,7 @@ function createRuntime(): MemoryRuntime {
     enabled: true,
     store: new MemoryStore(),
     recalledIds: new Set(),
+    skillsCatalog: null,
   };
 }
 
@@ -256,6 +361,89 @@ function createRuntimeStore() {
     clear(sessionKey: string): void {
       runtimes.delete(sessionKey);
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// LLM relevance gate — judge closure
+// ---------------------------------------------------------------------------
+
+/** maxTokens/temperature for the gate call — small, deterministic, cheap. */
+const GATE_MAX_TOKENS = 300;
+const GATE_TEMPERATURE = 0;
+
+/**
+ * Build the judge closure selectRecallRerank calls for gray-zone candidates.
+ * Follows the exact pattern verified against
+ * ~/.pi/agent/extensions/memory-summarizer.ts: resolve the model via
+ * ctx.modelRegistry.find(provider, id), resolve auth via
+ * ctx.modelRegistry.getApiKeyAndHeaders(model), call complete() with an
+ * AbortController timeout, parse the response. ExtensionContext (passed to
+ * every event handler, including before_agent_start) exposes modelRegistry
+ * directly — no extra wiring needed to reach it from this extension.
+ *
+ * Every error path (model not found, no auth, network/timeout, malformed
+ * response) resolves to null so selectRecallRerank fails open to the plain
+ * rerankMinScore rule. Never throws.
+ */
+function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGateOptions["judge"] {
+  return async (input: GateJudgeInput): Promise<GateVerdict | null> => {
+    try {
+      const model = ctx.modelRegistry?.find(config.autoRecallGateProvider, config.autoRecallGateModel);
+      if (!model) return null;
+
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+      if (!auth.ok || !auth.apiKey) return null;
+
+      const { system, user } = buildGatePrompt({
+        message: input.message,
+        project: input.project,
+        candidates: input.candidates,
+        skills: input.skills,
+      });
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), config.autoRecallGateTimeoutMs);
+      let responseText = "";
+      try {
+        const response = await complete(
+          model,
+          {
+            systemPrompt: system,
+            messages: [
+              {
+                role: "user" as const,
+                content: [{ type: "text" as const, text: user }],
+                timestamp: Date.now(),
+              },
+            ],
+          },
+          {
+            apiKey: auth.apiKey,
+            headers: auth.headers,
+            signal: controller.signal,
+            maxTokens: GATE_MAX_TOKENS,
+            temperature: GATE_TEMPERATURE,
+          } as any,
+        );
+        if (response.stopReason === "aborted") return null;
+        responseText = (response.content ?? [])
+          .filter((c: any) => c && c.type === "text" && typeof c.text === "string")
+          .map((c: any) => c.text)
+          .join("")
+          .trim();
+      } finally {
+        clearTimeout(timer);
+      }
+
+      const validKeys = input.candidates.map((c) => c.key);
+      const validSkills = (input.skills ?? []).map((s) => s.name);
+      return parseGateResponse(responseText, validKeys, validSkills);
+    } catch {
+      // Fail open: model resolution, auth, network, or parse error must
+      // never break auto-recall.
+      return null;
+    }
   };
 }
 
@@ -458,6 +646,26 @@ export default function memoryExtension(pi: ExtensionAPI) {
     if (runtime.config.autoRecall && runtime.backendAvailable) {
       void runtime.store.search("session warmup", { n_results: 1 }).catch(() => {});
     }
+
+    // Warm the cross-encoder reranker the same way. Best-effort: if the
+    // model never loads, selectRecall() fails open to the legacy path on
+    // every call, so a failed warm-up here is not fatal.
+    if (runtime.config.autoRecall && runtime.config.autoRecallRerank && runtime.backendAvailable) {
+      void warmReranker().catch(() => {});
+    }
+
+    // Cache the skills catalog for the LLM gate's skill-suggestion feature.
+    // Scanned once per session (skills rarely change mid-session); passed to
+    // the gate only when a gate call actually happens (see before_agent_start).
+    if (runtime.config.autoRecall && runtime.config.autoRecallLlmGate && runtime.config.autoRecallGateSuggestSkills) {
+      try {
+        runtime.skillsCatalog = scanSkillsCatalog();
+      } catch {
+        runtime.skillsCatalog = null;
+      }
+    } else {
+      runtime.skillsCatalog = null;
+    }
   };
 
   // -----------------------------------------------------------------------
@@ -573,31 +781,38 @@ export default function memoryExtension(pi: ExtensionAPI) {
       const query = (event.prompt || "").trim();
       if (query.length >= runtime.config.autoRecallMinPromptChars) {
         try {
-          const res = await runtime.store.search(query.slice(0, 2000), {
-            n_results: Math.max(runtime.config.autoRecallMaxResults * 2, 8),
+          const gate: RecallGateOptions | undefined = runtime.config.autoRecallLlmGate
+            ? {
+                judge: buildGateJudge(ctx, runtime.config),
+                suggestSkills:
+                  runtime.config.autoRecallGateSuggestSkills && runtime.skillsCatalog
+                    ? runtime.skillsCatalog
+                    : undefined,
+              }
+            : undefined;
+
+          const { picked, skills } = await selectRecall(runtime.store, query.slice(0, 2000), {
+            project: runtime.currentProject,
+            excludeIds: runtime.recalledIds,
+            config: runtime.config,
+            gate,
           });
-          const picked: typeof res.results = [];
-          let budget = runtime.config.autoRecallMaxChars;
-          for (const hit of res.results) {
-            if (hit.similarity < runtime.config.autoRecallMinSimilarity) continue;
-            if (runtime.recalledIds.has(hit.id)) continue;
-            if (hit.text.length > budget) continue;
-            picked.push(hit);
-            budget -= hit.text.length;
-            if (picked.length >= runtime.config.autoRecallMaxResults) break;
-          }
           if (picked.length > 0) {
             for (const hit of picked) runtime.recalledIds.add(hit.id);
             const lines = picked.map(
               (hit) =>
                 `- [${hit.project}/${hit.topic}] (${(hit.similarity * 100).toFixed(0)}% match, ${hit.timestamp.slice(0, 10)})\n  ${hit.text.replace(/\n/g, "\n  ")}`
             );
+            let content =
+              "Auto-recalled memories relevant to the latest user message (from the shared memory palace; they reflect what was true when saved — verify against the current code/config before relying on them):\n\n" +
+              lines.join("\n\n") +
+              "\n\nUse `memory_search` if you need deeper or differently-angled context.";
+            if (skills.length > 0) {
+              content += `\n\nPossibly relevant skills for this request: ${skills.join(", ")} (load if applicable).`;
+            }
             result.message = {
               customType: "pi-mempalace-recall",
-              content:
-                "Auto-recalled memories relevant to the latest user message (from the shared memory palace; they reflect what was true when saved — verify against the current code/config before relying on them):\n\n" +
-                lines.join("\n\n") +
-                "\n\nUse `memory_search` if you need deeper or differently-angled context.",
+              content,
               display: true,
             };
           }

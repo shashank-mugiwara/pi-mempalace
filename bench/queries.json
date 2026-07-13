@@ -1,0 +1,16 @@
+[
+ {"id":"q01","category":"specific","expected_project":"weaver","cwd_project":"weaver","query":"what did we decide about the naruto dev-box branch lifecycle?"},
+ {"id":"q02","category":"specific","expected_project":"prism","cwd_project":"prism","query":"how did we fix the prism arm64 capacity provider deploy failure?"},
+ {"id":"q03","category":"specific","expected_project":"prism","cwd_project":"prism","query":"what were the decisions from the prism memory layer grilling session?"},
+ {"id":"q04","category":"specific","expected_project":"weaver","cwd_project":"weaver","query":"why did the naruto dev-box email normalization trial cost so much?"},
+ {"id":"q05","category":"specific","expected_project":"persona-research","cwd_project":"persona-research","query":"what is the persona research project about?"},
+ {"id":"q06","category":"specific","expected_project":"punkrecords-datadog","cwd_project":"punkrecords-datadog","query":"how is datadog monitoring set up for punkrecords?"},
+ {"id":"q07","category":"generic","expected_project":null,"cwd_project":"prism","query":"fix the failing test"},
+ {"id":"q08","category":"generic","expected_project":null,"cwd_project":"prism","query":"now add error handling to that function"},
+ {"id":"q09","category":"generic","expected_project":null,"cwd_project":"prism","query":"can you refactor this to make it cleaner?"},
+ {"id":"q10","category":"generic","expected_project":null,"cwd_project":"prism","query":"the build is failing with a type error, help me fix it"},
+ {"id":"q11","category":"generic","expected_project":null,"cwd_project":"prism","query":"add a readme explaining how to run this project"},
+ {"id":"q12","category":"ambiguous","expected_project":"prism","cwd_project":"prism","query":"how do we deploy this service to the cluster?"},
+ {"id":"q13","category":"ambiguous","expected_project":"pi-config","cwd_project":"pi-config","query":"what did we decide about memory recall thresholds?"},
+ {"id":"q14","category":"ambiguous","expected_project":"weaver","cwd_project":"weaver","query":"which AWS cluster do our services run on?"}
+]

@@ -1,5 +1,147 @@
 # Fork changelog
 
+## 0.6.0 — 2026-07-13 — cross-encoder rerank + LLM relevance gate for auto-recall
+
+### Diagnosis (bench/results/baseline.json)
+
+The 0.4.0 auto-recall pipeline (bi-encoder similarity floor only, 0.5) had two
+failure modes visible in the bench harness (`bench/run-bench.mjs`):
+
+- **False positives:** cross-project junk at sim 0.50-0.55 got injected (e.g.
+  "fix the failing test" pulled a `salesappweb` Flutter memory at 0.5095 with
+  no connection to the current project).
+- **False negatives:** genuinely relevant memories sat just below the 0.5
+  floor (q03's correct memory at 0.467-0.490 sim, q13's at 0.386) and were
+  silently dropped.
+
+### Changes
+
+- **`extensions/pi-mempalace/recall.ts` (new):** the auto-recall selection
+  pipeline extracted into `selectRecall(store, query, opts)`, shared by
+  `index.ts`'s `before_agent_start` hook and `bench/run-bench.mjs` — bench and
+  production now run the exact same code, not a hand-ported copy.
+- **`extensions/pi-mempalace/reranker.ts` (new):** lazy-loaded cross-encoder
+  singleton (`Xenova/ms-marco-MiniLM-L-6-v2` via `@huggingface/transformers`).
+  Re-scores the candidate pool `store.search()` returns — much stronger
+  relevance judge near the decision boundary than bi-encoder cosine
+  similarity, at the cost of being too slow to run over the whole store.
+- **New retrieval design:** wider candidate pool (`autoRecallCandidates`, 24)
+  with a lower bi-encoder floor (`autoRecallCandidateFloor`, 0.45) to catch
+  the false negatives, then the cross-encoder is the real relevance gate
+  (`autoRecallRerankMinScore`), with a same-vs-cross-project penalty
+  (`autoRecallCrossProjectPenalty`, 0.08) applied on top to suppress the
+  false positives. Falls open to the pre-existing similarity-only ("legacy")
+  path on any reranker error — auto-recall must never block the agent loop.
+- **Reranker warm-up:** background warm-up at session start alongside the
+  existing embedder warm-up, so the first real recall doesn't pay model-load
+  latency.
+- **New config** (`~/.pi/agent/memory/config.json`):
+  `autoRecallMinPromptChars` raised 15 → 30; new `autoRecallCandidates` (24),
+  `autoRecallCandidateFloor` (0.45), `autoRecallCrossProjectPenalty` (0.08),
+  `autoRecallRerank` (default true), `autoRecallRerankMinScore` (0.35 —
+  tuned from the bench v2-rerank cross-encoder score distribution).
+- **`bench/run-bench.mjs`:** new `--stage legacy|v2` flag. `legacy` reproduces
+  the exact pre-rerank picks (verified against `bench/results/baseline.json`,
+  14/14 queries match) for regression-checking the legacy path stays
+  faithful; `v2` exercises the new defaults end-to-end, including per-query
+  `search_ms`/`rerank_ms` timings and full candidate score breakdowns
+  (bi-encoder sim, cross-encoder score, penalty, final score) for tuning
+  `autoRecallRerankMinScore`.
+
+### Tuning + same-project floor (bench v2-rerank → v3)
+
+- **`autoRecallRerankMinScore` 0.35 → 0.40:** tuned from the bench v2-rerank
+  cross-encoder score distribution, which turned out cleanly bimodal —
+  relevant candidates score 0.65+, junk scores <0.02. 0.40 sits in the empty
+  middle with margin either side.
+- **New `autoRecallCandidateFloorSameProject` (0.35):** bench q13 showed a
+  same-project relevant memory (pi-config, sim 0.386) never reaching the
+  cross-encoder because it sat below the single 0.45 bi-encoder floor.
+  Same-project candidates now pass at 0.35; cross-project candidates keep the
+  0.45 floor (they're already suppressed by `autoRecallCrossProjectPenalty`
+  downstream, so a lower floor there would just waste cross-encoder calls on
+  noise). Re-running q13 confirms the mechanism works — the previously
+  unreachable candidate now gets cross-encoded — but its actual ce scores
+  (0.00012 and 0.0028 for the two pi-config candidates in the pool) are far
+  below relevance for this exact query wording, so it's still correctly not
+  injected. The same-project floor did rescue real picks elsewhere: q01,
+  q03, q04, q06 each gained one newly-eligible same-project candidate with a
+  high ce score (0.68-0.94), and in q01/q03 that pick outranked and displaced
+  a previously-picked lower-ce-score candidate under the `autoRecallMaxResults`
+  cap — an expected consequence of widening the pool, not a bug.
+- **`reranker.ts`:** `rerank()` keeps the one-`(query, text)`-pair-per-call
+  loop as a *deliberate*, measured choice. Batching all pairs into a single
+  `tokenizer()` + `model()` call (transformers.js `text_pair` array form)
+  was implemented and verified score-equivalent (max abs diff ~1.9e-7 across
+  3- and 20-pair spot checks), but on this single-threaded CPU/WASM
+  onnxruntime backend it was consistently ~30-60% *slower*: ~450-510ms
+  looped vs ~555-770ms batched on a realistic 20-pair variable-length
+  (320-917 char) candidate pool, across 3 controlled runs on identical
+  input. Root cause: batching pads every pair up to the batch's longest
+  sequence, and the extra attention FLOPs spent on padding tokens cost more
+  than the per-call overhead batching saves on this runtime (length-sorting
+  and chunk-size-4 batching narrowed but never closed the gap). The batched
+  path was removed rather than kept as dead code; revisit only on a backend
+  with real batch parallelism (GPU/multi-threaded), re-measuring there
+  first.
+
+### LLM relevance gate (Haiku)
+
+Rerank alone still leaves a "gray zone" where the cross-encoder score is
+genuinely ambiguous (not obviously junk, not obviously relevant) and a
+numeric threshold has to guess. New optional gate: send gray-zone candidates
+to a cheap model and let it actually read the message and decide.
+
+- **`extensions/pi-mempalace/gate.ts` (new):** pure, pi-import-free prompt
+  building (`buildGatePrompt`) and tolerant response parsing
+  (`parseGateResponse`) — unit tested in `bench/gate-unit.mjs` (23/23
+  passing) independent of any model or store.
+- **`recall.ts` gray-zone partition:** after reranking, floor-survivors split
+  into auto-approve (`finalScore >= autoRecallGateAutoApprove`, 0.85),
+  auto-reject (`< autoRecallGateMinScore`, 0.15, never sent to the gate), and
+  gray zone (everything between). If gating is enabled and the gray zone is
+  non-empty, up to `autoRecallGateMaxCandidates` (10) gray-zone candidates go
+  to the gate in one call; `approved = auto-approved ∪ gate-approved`, then
+  the existing budget/`autoRecallMaxResults` pick loop runs over that set.
+  Empty gray zone → the gate is never called (auto-approve-only is
+  equivalent to the plain threshold rule there by construction). Any gate
+  failure — model not found, no auth, timeout, network error, unparseable
+  response — resolves to `null` and `selectRecallRerank` falls all the way
+  open to the plain `autoRecallRerankMinScore` rule over every
+  floor-survivor, i.e. exactly the pre-gate (v2) behavior. `selectRecall`
+  still takes zero `pi-ai`/`pi-coding-agent` imports — the caller supplies a
+  `gate.judge` closure, so `bench/run-bench.mjs` can drive the same partition
+  logic with a mock judge (`--stage v3 --gate-mock none|approve-all|reject-all`)
+  with no network calls.
+- **`index.ts` judge closure:** built per-prompt in `before_agent_start`,
+  following the exact pattern in
+  `~/.pi/agent/extensions/memory-summarizer.ts` — `ctx.modelRegistry.find(provider, id)`,
+  `ctx.modelRegistry.getApiKeyAndHeaders(model)`, `complete()` with an
+  `AbortController` timeout (`autoRecallGateTimeoutMs`, 2500ms),
+  temperature 0, 300 max tokens. `ExtensionContext` (passed to every
+  extension event handler) exposes `modelRegistry` directly, so no extra
+  wiring was needed to reach it from this extension. Every error path
+  returns `null` (fail open); the closure never throws.
+- **Skill suggestions:** at session start, if `autoRecallGateSuggestSkills`
+  is on, `~/.pi/agent/skills/*/SKILL.md` frontmatter is scanned for
+  `name:`/`description:` (description truncated to 200 chars) and cached for
+  the session. The catalog is only handed to the gate when a gate call
+  actually happens (non-empty gray zone). Up to 2 suggested skill names are
+  appended to the injected recall message: "Possibly relevant skills for
+  this request: … (load if applicable)."
+- **New config** (`~/.pi/agent/memory/config.json`): `autoRecallLlmGate`
+  (default `true`), `autoRecallGateProvider` (`"anthropic"`),
+  `autoRecallGateModel` (`"claude-haiku-4-5"`), `autoRecallGateTimeoutMs`
+  (2500), `autoRecallGateAutoApprove` (0.85), `autoRecallGateMinScore`
+  (0.15), `autoRecallGateMaxCandidates` (10), `autoRecallGateSuggestSkills`
+  (default `true`); plus `autoRecallRerankMinScore` retuned 0.35 → 0.40 and
+  new `autoRecallCandidateFloorSameProject` (0.35) from the tuning pass
+  above.
+- **`bench/run-bench.mjs`:** new `--stage v3` (v2 params + gate partition,
+  driven by `--gate-mock none|approve-all|reject-all` instead of a real
+  model call — validates plumbing only) and `bench/gate-unit.mjs` (pure unit
+  tests for `gate.ts`, no store/model access).
+
 ## 0.5.0 — 2026-07-10 — standalone CLI, relocatable store, audit fixes
 
 Prompted by deploying the palace on a second machine (no pi installed) and a
