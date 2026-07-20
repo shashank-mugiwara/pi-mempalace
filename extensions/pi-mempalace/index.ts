@@ -415,16 +415,34 @@ function logRecallOutcome(project: string, query: string, r: RecallResult, failM
   }
 }
 
+/** Append a gate failure reason to recall-gate.log — a FAILED line without a why is undebuggable. */
+function logGateError(reason: string): void {
+  try {
+    fs.appendFileSync(
+      path.join(MEMORY_DIR, "recall-gate.log"),
+      `${new Date().toISOString()} gate-error: ${reason}\n`
+    );
+  } catch {
+    /* never break recall */
+  }
+}
+
 function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGateOptions["judge"] {
   return async (input: GateJudgeInput): Promise<GateVerdict | null> => {
     try {
       const model = ctx.modelRegistry?.find(config.autoRecallGateProvider, config.autoRecallGateModel);
-      if (!model) return null;
+      if (!model) {
+        logGateError(`model-not-found ${config.autoRecallGateProvider}/${config.autoRecallGateModel}`);
+        return null;
+      }
 
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
       // Header-only auth (OAuth-style providers) is valid — requiring apiKey
       // rejected those and silently disabled the gate on such installs.
-      if (!auth.ok || (!auth.apiKey && !auth.headers)) return null;
+      if (!auth.ok || (!auth.apiKey && !auth.headers)) {
+        logGateError(`auth-unavailable for ${config.autoRecallGateProvider} (ok=${auth.ok})`);
+        return null;
+      }
 
       const { system, user } = buildGatePrompt({
         message: input.message,
@@ -457,7 +475,10 @@ function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGate
             temperature: GATE_TEMPERATURE,
           } as any,
         );
-        if (response.stopReason === "aborted") return null;
+        if (response.stopReason === "aborted") {
+          logGateError(`aborted (timeout ${config.autoRecallGateTimeoutMs}ms)`);
+          return null;
+        }
         responseText = (response.content ?? [])
           .filter((c: any) => c && c.type === "text" && typeof c.text === "string")
           .map((c: any) => c.text)
@@ -469,10 +490,15 @@ function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGate
 
       const validKeys = input.candidates.map((c) => c.key);
       const validSkills = (input.skills ?? []).map((s) => s.name);
-      return parseGateResponse(responseText, validKeys, validSkills);
-    } catch {
-      // Fail open: model resolution, auth, network, or parse error must
-      // never break auto-recall.
+      const verdict = parseGateResponse(responseText, validKeys, validSkills);
+      if (verdict === null) {
+        logGateError(`unparseable-response: ${responseText.slice(0, 160).replace(/\n/g, " ")}`);
+      }
+      return verdict;
+    } catch (error) {
+      // Failure semantics (open vs closed) are decided by recall.ts via
+      // autoRecallGateFailMode — but the reason must never be silent again.
+      logGateError(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
       return null;
     }
   };
