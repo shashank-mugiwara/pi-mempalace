@@ -26,6 +26,7 @@
  *   projects [--json]
  *   kg-add   <subject> <predicate> <object> [--project P] [--from DATE] [--to DATE]
  *   kg-query <entity> [--at DATE] [--project P] [--json]
+ *   kg-invalidate <subject> <predicate> <object> [--to DATE]
  *
  * Run `node mempalace.mjs --help` for full details.
  */
@@ -137,6 +138,19 @@ function cmdKgAdd(subject, predicate, object, opts) {
   emit(opts, result, () => `fact #${result.id}: ${subject} ${predicate} ${object}`);
 }
 
+function cmdKgInvalidate(subject, predicate, object, opts) {
+  if (!subject || !predicate || !object)
+    fail("kg-invalidate requires <subject> <predicate> <object> (the active fact to end)");
+  const id = store.findTriple(subject, predicate, object);
+  if (id === null)
+    fail(`no active fact matches: ${subject} ${predicate} ${object} (already ended, or names differ — check kg-query "${subject}")`);
+  store.invalidateTriple(id, opts.to || undefined);
+  const endDate = opts.to || localToday();
+  emit(opts, { status: "invalidated", id, valid_to: endDate }, () =>
+    `fact #${id} ended ${endDate}: ${subject} ${predicate} ${object}`
+  );
+}
+
 function cmdKgQuery(entity, opts) {
   if (!entity) fail("kg-query requires an <entity>");
   const result = store.queryEntity(entity, {
@@ -203,6 +217,8 @@ COMMANDS
       --project P  --from DATE  --to DATE  --json
   kg-query <entity>                Query facts about an entity
       --at DATE  --project P  --json
+  kg-invalidate <subj> <pred> <obj>  End an active fact (sets valid_to; pair with a
+      --to DATE  --json              fresh kg-add when a fact is superseded)
 
 NOTES
   Same engine code as the pi extension (imported from memory_store.ts), so
@@ -226,6 +242,7 @@ async function main() {
     case "projects": return cmdProjects(opts);
     case "kg-add": return cmdKgAdd(positional[0], positional[1], positional[2], opts);
     case "kg-query": return cmdKgQuery(positional[0], opts);
+    case "kg-invalidate": return cmdKgInvalidate(positional[0], positional[1], positional[2], opts);
     default: fail(`unknown command: ${cmd}. Run --help.`);
   }
 }

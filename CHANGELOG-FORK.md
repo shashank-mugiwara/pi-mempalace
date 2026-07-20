@@ -1,5 +1,49 @@
 # Fork changelog
 
+## 0.7.0 — 2026-07-20 — cross-agent protocol, first-prompt explorer subagent for Claude Code, CLI kg-invalidate
+
+Extends the palace's non-blind retrieval + disciplined writing to the *other*
+agents sharing the store (Claude Code, opencode, codex). No extension changes —
+pi's pinned install (`@4299d94`, v0.6.0 behavior) is untouched; everything here
+is CLI/hooks/docs, live immediately via the fork-repo paths.
+
+- **`hooks/claude-first-prompt-explorer.mjs` (new):** Claude Code
+  `UserPromptSubmit` hook. On the first substantive prompt of a session (>=30
+  chars, not a slash command, once per session_id via a tmpdir marker) it
+  spawns a headless Haiku subagent (`claude -p --model claude-haiku-4-5`,
+  Bash restricted to `node`, 90s cap, cwd=tmpdir so no project settings load)
+  that explores the store agentically — `projects` taxonomy, 2-4 differently
+  phrased searches, `kg-query` on surfaced entities, project `recall` — and
+  distills only what changes the approach to the actual request into a
+  `<memory-palace-context>` block, which the hook prints for injection.
+  Replaces one-shot blind semantic search over the raw prompt (the same
+  false-positive/false-negative failure mode the 0.6.0 rerank work measured
+  in pi, attacked here with agentic exploration instead of an in-process
+  pipeline, since Claude Code hooks can run a full subagent). Degrades
+  honestly: `claude` missing/timeout/non-zero → deterministic multi-probe
+  fallback (semantic search + recent same-project memories); subagent says
+  `NO_RELEVANT_MEMORY` → injects nothing (no fallback — that's a verdict,
+  not a failure); any unexpected error → exit 0, no output. Recursion-guarded
+  via `MEMPALACE_EXPLORER=1` (the nested session's own UserPromptSubmit hook
+  sees it and exits). Narration the model prefixes before its first bullet is
+  stripped post-hoc. Registered in `~/.claude/settings.json` with timeout 120.
+- **`cli/mempalace.mjs`: new `kg-invalidate <subj> <pred> <obj> [--to DATE]`.**
+  Closes the CLI/pi asymmetry: pi always had `knowledge_invalidate`, so only
+  pi could end a superseded fact — Claude/opencode/codex could only pile up
+  contradictory active triples. Resolves by name via the store's existing
+  `findTriple` (active-only, most recent) + `invalidateTriple`; errors clearly
+  when no active fact matches. Verified round-trip in a `MEMPALACE_HOME` temp
+  store: add → invalidate --to → re-add → `--at` queries resolve each era
+  correctly, double-invalidate fails loudly.
+- **`PROTOCOL.md` (new):** canonical cross-agent recall/save/KG protocol —
+  explore-don't-one-shot recall method, save hygiene (self-contained, tagged,
+  importance scale, supersede-don't-duplicate), KG conventions (canonical
+  lowercase-kebab entities, controlled predicate vocabulary, temporal honesty
+  via invalidate+re-add, memory-vs-triple granularity test). The per-agent
+  instruction blocks (`shared-memory-palace` skill, `~/.codex/AGENTS.md`,
+  `~/.config/opencode/AGENTS.md`, `~/.pi/agent/APPEND_SYSTEM.md`) are
+  summaries of this file and defer to it on drift.
+
 ## 0.6.0 — 2026-07-13 — cross-encoder rerank + LLM relevance gate for auto-recall
 
 ### Diagnosis (bench/results/baseline.json)
