@@ -81,7 +81,8 @@ async function cmdTick(opts) {
       }
     }
 
-    log(`tick: ${all.length} deltas, ${eligible.length} eligible, ${noiseAdvanced} noise-advanced, seeded ${seeded}`);
+    const tracked = `tracked: files=${Object.keys(state.files).length} opencode=${Object.keys(state.opencode).length}`;
+    log(`tick: ${all.length} deltas, ${eligible.length} eligible, ${noiseAdvanced} noise-advanced, seeded ${seeded}, ${tracked}`);
     console.log(`deltas: ${all.length} | eligible (>=${cfg.minNewChars} chars, quiet ${cfg.quietMs / 60000}m): ${eligible.length}`);
     for (const c of all) {
       const el = eligible.includes(c) ? "ELIGIBLE" : "below-gate";
