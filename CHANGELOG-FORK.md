@@ -1,5 +1,73 @@
 # Fork changelog
 
+## 0.8.0 — 2026-07-20 — session-watchdog: 15-min cross-agent memory curation via gpt-5.6-terra
+
+Background watchdog that keeps the palace *current* from live session data of
+all four agents, replacing pi-only end-of-session summarization. Grilled and
+approved design: pi-extension-hosted timer, codex-exec/terra summarizer,
+additive-auto/destructive-queued apply policy, read-only Obsidian consult.
+
+- **`watchdog/` core + `cli/watchdog.mjs` (new, standalone node):**
+  - *Collectors* read new user+assistant dialogue (tool noise excluded) since
+    per-session watermarks: Claude Code (`~/.claude/projects/*/*.jsonl`, byte
+    offsets, sidechain/system-reminder entries skipped), pi
+    (`~/.pi/agent/sessions/*/*.jsonl`), codex
+    (`~/.codex/sessions/Y/M/D/rollout-*.jsonl`, `event_msg`
+    user_message/agent_message), opencode (read-only better-sqlite3 over
+    `~/.local/share/opencode/opencode.db` session/message/part,
+    `time_created` watermarks). JSONL offsets only ever advance past complete
+    lines; partial trailing lines stay unconsumed.
+  - *Seeding:* first run watermarks every existing source at EOF (no
+    surprise backfill of history; `tick --backfill <hours>` reaches back
+    deliberately). Sources appearing later are new sessions and start at 0.
+  - *Worth-it gate:* >=10KB new dialogue AND >=5 min quiet, max 4 sessions
+    per tick, oldest first; zero-dialogue (pure tool noise) deltas advance
+    their watermark without a model call. Config overrides via
+    `watchdog*` keys in `~/.pi/agent/memory/config.json`;
+    `watchdogEnabled: false` is the kill switch.
+  - *Summarizer:* `codex exec --sandbox read-only -m gpt-5.6-terra -c
+    model_reasoning_effort="high" --output-last-message <tmp> -` (prompt on
+    stdin, existing ChatGPT auth). Prompt carries the delta, related
+    memories WITH real ids/importance, project KG facts, canonical project
+    list, a read-only Obsidian hub-note excerpt, and the PROTOCOL.md write
+    conventions; contract is strict JSON
+    (memories/kg_facts/supersedes/kg_invalidations/doubts). Fail-closed: any
+    codex error or unparseable output leaves the watermark untouched — the
+    delta retries next tick.
+  - *Apply policy — additive auto, destructive queued:* auto = new memories
+    (importance clamped <=0.85, near-dupe skip at >=0.92 similarity), new KG
+    facts (exact-active-dupe skip), high-confidence supersedes of
+    sub-0.85-importance memories, high-confidence kg invalidations. Queued to
+    `watchdog-review.json` = everything touching >=0.85 memories,
+    low-confidence changes, all doubts, session-vs-Obsidian disagreements.
+    Unknown target importance is treated as high (queued) by construction.
+  - Verified end-to-end on a synthetic 14KB session: gate split
+    eligible/below-gate/live-session correctly; terra (25s) returned
+    contract-clean JSON and — unprompted — routed unverified implementation
+    claims to doubts instead of memories.
+- **`extensions/session-watchdog.ts` (new) + shim in
+  `~/.pi/agent/extensions/`:** schedules `watchdog.mjs tick` every 15 min
+  (first 2 min after session start), detached; the CLI's own 15-min-stale
+  cross-process lock makes multi-instance scheduling safe. When the review
+  queue is non-empty, appends a one-time system-prompt block instructing the
+  agent to walk the user through each item via AskUserQuestion at the next
+  natural pause and apply verdicts with `watchdog.mjs apply-review`.
+  `/memory-watchdog tick|status|review` for manual control.
+- **memory-summarizer handover:** its automatic session_shutdown /
+  session_before_compact distills are disabled (early-return unless
+  `PI_MEMSUM_AUTO=1`); manual `/memory-summarize` unchanged. One pipeline,
+  one watermark store, no duplicate pi summaries.
+- **Bedrock auth fixes (outside repo, recorded here):**
+  `~/.local/bin/pi` wrapper's SSO expiry scan now keys off the NEWEST
+  `~/.aws/sso/cache` token instead of the earliest — stale cache files made
+  it nag "expiring in N min" (huge/negative N) every 5 min even after a
+  successful login — and the displayed minutes are clamped at 0.
+  `extensions/bedrock-profiles.ts` now records `lastAttemptAt` on FAILED
+  exports too, so a dead SSO session backs off 30s instead of erroring every
+  turn. No session auto-reload: credentials are process-env-level and
+  re-resolved lazily per turn; restarting the session would only destroy
+  context.
+
 ## 0.7.0 — 2026-07-20 — cross-agent protocol, first-prompt explorer subagent for Claude Code, CLI kg-invalidate
 
 Extends the palace's non-blind retrieval + disciplined writing to the *other*
