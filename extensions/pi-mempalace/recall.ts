@@ -49,6 +49,13 @@ export interface RecallConfigSubset {
   autoRecallGateAutoApprove: number;
   autoRecallGateMinScore: number;
   autoRecallGateMaxCandidates: number;
+  /**
+   * What to do when the gate judge fails (model/auth/timeout/parse → null):
+   * "open" (historical default) injects every floor-survivor >= rerankMinScore;
+   * "closed" injects only the auto-approve tier (>= autoRecallGateAutoApprove) —
+   * the gray zone is dropped rather than guessed at.
+   */
+  autoRecallGateFailMode?: "open" | "closed";
 }
 
 /** Input handed to the gate judge for one gray-zone batch. */
@@ -327,9 +334,14 @@ async function selectRecallRerank(
       gate_ms = performance.now() - tg0;
 
       if (verdict === null) {
-        // Fail open: plain rerankMinScore rule over ALL floor-survivors —
-        // exactly the pre-gate (v2) behavior.
-        approvedSet = floorSurvivors.filter((c) => c.finalScore >= cfg.autoRecallRerankMinScore);
+        // Judge unavailable. "open" (default): plain rerankMinScore rule over
+        // ALL floor-survivors — exactly the pre-gate (v2) behavior. "closed":
+        // only the auto-approve tier passes; the gray zone is dropped, never
+        // guessed at (for stores where noisy injection is worse than a miss).
+        approvedSet =
+          cfg.autoRecallGateFailMode === "closed"
+            ? approvedAuto
+            : floorSurvivors.filter((c) => c.finalScore >= cfg.autoRecallRerankMinScore);
         gateInfo = {
           grayCount: gray.length,
           called: true,

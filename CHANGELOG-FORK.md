@@ -1,5 +1,32 @@
 # Fork changelog
 
+## 0.8.1 — 2026-07-20 — recall-gate observability + fail-closed mode + header-auth fix
+
+The "noisy auto-recall" complaint traced to the 0.6.0 LLM gate being able to
+fail SILENTLY open (any model/auth/timeout error → plain threshold injection,
+indistinguishable from a real judgment). Three fixes:
+
+- **`recall-gate.log`:** one line per auto-recall (`~/.pi/agent/memory/`),
+  showing mode, picked/candidates, gate outcome (`ok` / `idle` /
+  `FAILED(fell-open|fell-closed)`), auto vs gate-approved counts, and
+  search/rerank/gate timings — silent behavior is now auditable.
+- **`autoRecallGateFailMode` ("open"|"closed", default "open"):** "closed"
+  injects only the auto-approve tier (cross-encoder >= 0.85) when the judge
+  is unavailable — the gray zone is dropped, never guessed at. Verified
+  against the live store with a null judge: open picked 4 (threshold rule),
+  closed picked 3 (auto tier only), gray zone of 9 dropped.
+- **Header-only auth accepted:** `buildGateJudge` required `auth.apiKey`,
+  silently disabling the gate on OAuth-style providers; now `apiKey OR
+  headers` suffices (matches what `complete()` actually needs).
+- **Local config retargeted (not in repo):** gate provider/model switched to
+  `openai-codex`/`gpt-5.4-mini` — the exact auth path memory-summarizer has
+  proven working on this install — with `failMode: "closed"` and
+  `autoRecallMaxResults` 4→3.
+- Bench: legacy parity 13/14 vs baseline (q04 drift = two relevant weaver
+  cost-optimization memories saved AFTER the baseline was recorded — store
+  drift, not regression); gate-unit 23/23.
+
+
 ## 0.8.0 — 2026-07-20 — session-watchdog: 15-min cross-agent memory curation via gpt-5.6-terra
 
 Background watchdog that keeps the palace *current* from live session data of

@@ -36,7 +36,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { localToday, MemoryStore } from "./memory_store.js";
-import { selectRecall, type GateJudgeInput, type RecallGateOptions } from "./recall.ts";
+import { selectRecall, type GateJudgeInput, type RecallGateOptions, type RecallResult } from "./recall.ts";
 import { warmReranker } from "./reranker.ts";
 import { buildGatePrompt, parseGateResponse, type GateSkillInput, type GateVerdict } from "./gate.ts";
 
@@ -112,6 +112,8 @@ interface MemoryConfig {
   autoRecallGateModel: string;
   /** Hard timeout (ms) for the gate model call — abort and fail open past this */
   autoRecallGateTimeoutMs: number;
+  /** Gate failure behavior: "open" injects rerank-threshold survivors, "closed" injects only the auto-approve tier (see recall.ts) */
+  autoRecallGateFailMode: "open" | "closed";
   /** Candidates with finalScore >= this skip the gate entirely (auto-approved) */
   autoRecallGateAutoApprove: number;
   /** Candidates with finalScore below this are auto-rejected and never sent to the gate */
@@ -272,6 +274,7 @@ function defaultConfig(): MemoryConfig {
     autoRecallGateProvider: "anthropic",
     autoRecallGateModel: "claude-haiku-4-5",
     autoRecallGateTimeoutMs: 2500,
+    autoRecallGateFailMode: "open",
     autoRecallGateAutoApprove: 0.85,
     autoRecallGateMinScore: 0.15,
     autoRecallGateMaxCandidates: 10,
@@ -386,6 +389,32 @@ const GATE_TEMPERATURE = 0;
  * response) resolves to null so selectRecallRerank fails open to the plain
  * rerankMinScore rule. Never throws.
  */
+/**
+ * One line per auto-recall to ~/.pi/agent/memory/recall-gate.log so gate
+ * behavior is auditable — before this, a gate that silently failed open
+ * (auth/model/timeout) was indistinguishable from one that judged and
+ * approved, and noisy injection had no paper trail.
+ */
+function logRecallOutcome(project: string, query: string, r: RecallResult, failMode: string): void {
+  try {
+    const g = r.gate;
+    const gateStr = !g
+      ? "gate=off"
+      : !g.called
+        ? `gate=idle gray=0 auto=${g.approvedAutoCount}`
+        : g.failedOpen
+          ? `gate=FAILED(fell-${failMode}) gray=${g.grayCount} auto=${g.approvedAutoCount}`
+          : `gate=ok gray=${g.grayCount} auto=${g.approvedAutoCount} gateApproved=${g.gateApprovedCount}`;
+    const line =
+      `${new Date().toISOString()} [${project}] mode=${r.mode} picked=${r.picked.length}/${r.candidates.length} ` +
+      `${gateStr} t=${Math.round(r.timings.search_ms)}/${Math.round(r.timings.rerank_ms)}/${Math.round(r.timings.gate_ms)}ms ` +
+      `q="${query.slice(0, 70).replace(/\n/g, " ")}"\n`;
+    fs.appendFileSync(path.join(MEMORY_DIR, "recall-gate.log"), line);
+  } catch {
+    // observability must never break recall
+  }
+}
+
 function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGateOptions["judge"] {
   return async (input: GateJudgeInput): Promise<GateVerdict | null> => {
     try {
@@ -393,7 +422,9 @@ function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGate
       if (!model) return null;
 
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-      if (!auth.ok || !auth.apiKey) return null;
+      // Header-only auth (OAuth-style providers) is valid — requiring apiKey
+      // rejected those and silently disabled the gate on such installs.
+      if (!auth.ok || (!auth.apiKey && !auth.headers)) return null;
 
       const { system, user } = buildGatePrompt({
         message: input.message,
@@ -791,12 +822,14 @@ export default function memoryExtension(pi: ExtensionAPI) {
               }
             : undefined;
 
-          const { picked, skills } = await selectRecall(runtime.store, query.slice(0, 2000), {
+          const recallResult = await selectRecall(runtime.store, query.slice(0, 2000), {
             project: runtime.currentProject,
             excludeIds: runtime.recalledIds,
             config: runtime.config,
             gate,
           });
+          const { picked, skills } = recallResult;
+          logRecallOutcome(runtime.currentProject, query, recallResult, runtime.config.autoRecallGateFailMode || "open");
           if (picked.length > 0) {
             for (const hit of picked) runtime.recalledIds.add(hit.id);
             const lines = picked.map(
