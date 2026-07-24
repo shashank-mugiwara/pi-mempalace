@@ -1012,6 +1012,14 @@ export class MemoryStore {
       );
     }
 
+    // L0.5: Prospective memory — where work on this project left off.
+    // Deliberately NOT left to L1's importance ranking: L1 is
+    // `ORDER BY importance DESC LIMIT 15` over a project that may hold
+    // hundreds of 0.9+ memories, and it truncates snippets to 200 chars.
+    // A resume record must surface every session, in full, or it is useless.
+    const resume = this.latestResume(project);
+    if (resume) parts.push(resume);
+
     // L1: Essential Story (cached)
     if (this.cachedL1 === null) {
       this.cachedL1 = this.generateL1(project, maxChars);
@@ -1020,6 +1028,48 @@ export class MemoryStore {
 
     const text = parts.join("\n");
     return { text, token_estimate: Math.ceil(text.length / 4) };
+  }
+
+  /**
+   * Most recent `session-resume` memory for `project`, reassembled from its
+   * chunk family so a long hand-off arrives whole rather than clipped at the
+   * 800-char chunk boundary. Returns null when the project has never had one
+   * (or when no project is in scope — a resume record only means something
+   * relative to the repo you are sitting in).
+   */
+  private latestResume(project: string | null): string | null {
+    if (!project) return null;
+    try {
+      const head = this.db
+        .prepare(
+          `SELECT id, timestamp FROM memories
+           WHERE project = ? AND topic = 'session-resume' AND chunk_index = 0
+           ORDER BY timestamp DESC LIMIT 1`
+        )
+        .get(project) as { id: string; timestamp: string } | undefined;
+      if (!head) return null;
+
+      const family = this.db
+        .prepare(
+          `SELECT content FROM memories
+           WHERE id = ? OR parent_id = ?
+           ORDER BY chunk_index ASC`
+        )
+        .all(head.id, head.id) as { content: string }[];
+
+      const body = family.map((r) => r.content).join("\n").trim();
+      if (!body) return null;
+
+      return (
+        `## Memory — Where we left off (${project}, saved ${head.timestamp.slice(0, 10)})\n` +
+        `${body}\n\n` +
+        `_This is the last recorded hand-off, not live state — verify against the current code, ` +
+        `git log and git status before acting on it. When this session's work reaches a stopping ` +
+        `point, supersede it (see \`session-resume\` in PROTOCOL.md)._`
+      );
+    } catch {
+      return null; // wake-up context is best-effort; never block startup
+    }
   }
 
   /**

@@ -1,5 +1,43 @@
 # Fork changelog
 
+## 0.8.3 — 2026-07-25 — procedural + prospective memory
+
+The palace could recall *what happened* (memories) and *what is true* (KG), but
+was blind to *what tools I have* and *what I was in the middle of*. Both fixed.
+
+- **`scanSkillsCatalog` saw 19 of 101 skills.** Two independent bugs. (1) It
+  tested `Dirent.isDirectory()`, which is **false for a symlink to a
+  directory** — 56 of the 75 entries in `~/.pi/agent/skills` are symlinks, so
+  the entire `cognition-*` and `thinking-*` libraries were invisible,
+  including `cognition-router` and `thinking-scientific-method`, the two the
+  system prompt leans on hardest. (2) It scanned only that one directory,
+  missing npm packages (`<pkg>/skills/<name>/`, plus an `@scope` level), git
+  packages (`<owner>/<repo>/skills/<name>/`) and the unsymlinked remainder of
+  the thinking library. Now walks four roots via `statSync` (follows
+  symlinks), prunes nested `node_modules`, and dedupes by name with earlier
+  roots winning. Verified against the live tree: **19 → 101**.
+- **`session-resume`: prospective memory.** New L0.5 slot in `wakeup()` injects
+  the project's single `session-resume` record — whole, chunk-family
+  reassembled, above L1. Deliberately not left to L1 (`ORDER BY importance
+  DESC LIMIT 15` over projects holding hundreds of 0.9+ memories, snippets
+  clipped at 200 chars) nor to semantic auto-recall ("continue" is 8 chars,
+  under the 30-char `autoRecallMinPromptChars` floor — prompt-driven recall
+  never fires on the prompt that most needs it). Convention documented in
+  `PROTOCOL.md`: exactly one per project, superseded not appended.
+- **Claude Code hook parity.** `claude-first-prompt-explorer.mjs` now fetches
+  the resume record deterministically via `--json` (the human `recall` output
+  flattens newlines and truncates at 280 chars, decapitating the
+  Next/Where/Blockers lines) and emits it on the first prompt of **any**
+  length, on a marker independent of the exploration marker — so a session
+  opening with "continue" gets the hand-off immediately and still explores on
+  the next substantive request.
+- Bench: legacy stage reproduces `baseline.json` exactly — 14/14 per-query
+  picks and all `by_category` figures identical. Neither change touches recall
+  ranking (the catalog feeds only gate skill-suggestions; the resume slot only
+  wake-up assembly). Typecheck: no new errors (3 pre-existing `Theme` errors
+  unchanged).
+
+
 ## 0.8.1 — 2026-07-20 — recall-gate observability + fail-closed mode + header-auth fix
 
 The "noisy auto-recall" complaint traced to the 0.6.0 LLM gate being able to

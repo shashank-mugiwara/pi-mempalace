@@ -109,6 +109,37 @@ function runSubagent(prompt, project) {
   return text.slice(0, MAX_CONTEXT_CHARS + 400);
 }
 
+/**
+ * The project's `session-resume` hand-off, fetched deterministically.
+ *
+ * Never routed through the exploring subagent: that subagent is instructed to
+ * keep only what is relevant to *this* prompt, and "where we left off" is
+ * relevant to the session rather than the message. It is also the context most
+ * needed by the prompts this hook otherwise ignores — "continue" is 8
+ * characters, well under the 30-char exploration floor.
+ */
+function resumeBlock(project) {
+  // --json, not the human output: `recall` flattens newlines and truncates to
+  // 280 chars, which decapitates a hand-off exactly at the Next/Where/Blockers
+  // lines that carry the value. A resume record is injected whole or not at all.
+  const raw = mempalace([
+    "recall", "--project", project, "--topic", "session-resume", "-n", "1", "--json",
+  ]);
+  if (!raw) return "";
+  let entry;
+  try {
+    entry = JSON.parse(raw).results?.[0];
+  } catch {
+    return "";
+  }
+  if (!entry?.text?.trim()) return "";
+  return (
+    `**Where we left off in \`${project}\`** (last recorded hand-off, saved ` +
+    `${String(entry.timestamp).slice(0, 10)} — not live state; check ` +
+    `\`git status\`/\`git log\` before acting on it):\n\n${entry.text.trim()}`
+  );
+}
+
 function deterministicFallback(prompt, project) {
   const search = mempalace(["search", prompt.slice(0, 300), "-n", "5"]);
   const recent = mempalace(["recall", "--project", project, "-n", "3"]);
@@ -132,25 +163,51 @@ function main() {
   const sessionId = input.session_id || "unknown";
   const project = basename(input.cwd || process.cwd());
 
-  const marker = join(tmpdir(), `mempalace-explored-${sessionId}`);
-  if (existsSync(marker)) return out("");
-  if (prompt.length < 30 || prompt.startsWith("/")) return out("");
-  try {
-    writeFileSync(marker, new Date().toISOString());
-  } catch {
-    /* marker is best-effort; a duplicate exploration is annoying, not fatal */
+  // Two independent once-per-session markers. The resume hand-off is emitted
+  // on the first prompt of any length; exploration still waits for a
+  // substantive one, so a session opening with "continue" gets the hand-off
+  // now and full exploration on the next real request.
+  const exploredMarker = join(tmpdir(), `mempalace-explored-${sessionId}`);
+  const resumeMarker = join(tmpdir(), `mempalace-resume-${sessionId}`);
+
+  const sections = [];
+  if (!existsSync(resumeMarker)) {
+    const resume = resumeBlock(project);
+    if (resume) {
+      sections.push(resume);
+      // Marked only on success: a cold first run can spend the 20s spawn
+      // budget loading the embedding model and come back empty. Marking
+      // before the fetch would burn the session's only attempt on that,
+      // silently dropping the hand-off. A duplicate injection is the
+      // cheaper failure.
+      try {
+        writeFileSync(resumeMarker, new Date().toISOString());
+      } catch {
+        /* best-effort */
+      }
+    }
   }
 
-  let context = runSubagent(prompt, project);
-  if (context === null) context = deterministicFallback(prompt, project);
-  if (!context) return out("");
+  const explorable = prompt.length >= 30 && !prompt.startsWith("/");
+  if (explorable && !existsSync(exploredMarker)) {
+    try {
+      writeFileSync(exploredMarker, new Date().toISOString());
+    } catch {
+      /* marker is best-effort; a duplicate exploration is annoying, not fatal */
+    }
+    let context = runSubagent(prompt, project);
+    if (context === null) context = deterministicFallback(prompt, project);
+    if (context) sections.push(context);
+  }
+
+  if (!sections.length) return out("");
 
   out(
     `<memory-palace-context>\n` +
       `Context recalled from the shared memory palace (pi/Claude Code/opencode/codex sessions). ` +
       `It reflects what was true when saved — verify against current code/config before relying on it. ` +
       `For deeper or differently-angled context: node ${CLI} search "..."\n\n` +
-      context +
+      sections.join("\n\n---\n\n") +
       `\n</memory-palace-context>`
   );
 }

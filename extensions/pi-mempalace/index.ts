@@ -62,6 +62,25 @@ const MAX_TOPICS_PER_PROJECT = 5;
 const MIN_PROJECT_MEMORIES = 5;
 /** Where skill packs live — scanned for the gate's skill-suggestion feature. */
 const SKILLS_DIR = path.join(os.homedir(), ".pi", "agent", "skills");
+const PI_AGENT_DIR = path.join(os.homedir(), ".pi", "agent");
+/**
+ * Every root pi can resolve a skill from, in precedence order. `depth` is how
+ * many directory levels sit between the root and the skill directory itself:
+ *   depth 0 — <root>/<skill>/SKILL.md          (user skills, thinking library)
+ *   depth 1 — <root>/<pkg>/skills/<skill>/SKILL.md      (npm packages)
+ *   depth 2 — <root>/<owner>/<repo>/skills/<skill>/SKILL.md  (git packages)
+ * Earlier roots win on name collision, so a hand-authored skill in
+ * ~/.pi/agent/skills overrides a package-provided one of the same name.
+ */
+const SKILL_ROOTS: { dir: string; depth: number; nested?: string }[] = [
+  { dir: SKILLS_DIR, depth: 0 },
+  // depth 2, not 1: scoped packages interpose an @scope segment
+  // (@dietrichgebert/ponytail/skills/<name>). The `nested` grandparent check
+  // keeps the extra level from admitting anything outside a `skills/` dir.
+  { dir: path.join(PI_AGENT_DIR, "npm", "node_modules"), depth: 2, nested: "skills" },
+  { dir: path.join(PI_AGENT_DIR, "git", "github.com"), depth: 2, nested: "skills" },
+  { dir: path.join(PI_AGENT_DIR, "thinking", "skills"), depth: 0 },
+];
 /** Truncate a skill's frontmatter description to this many chars before offering it to the gate. */
 const MAX_SKILL_DESCRIPTION_CHARS = 200;
 
@@ -202,41 +221,85 @@ function buildTaxonomySection(
 // ---------------------------------------------------------------------------
 
 /**
- * Scan each `SKILL.md` under SKILLS_DIR (one subdirectory per skill) for
- * frontmatter `name:` and `description:`, truncating descriptions to
- * MAX_SKILL_DESCRIPTION_CHARS. Best-effort: missing/unreadable/malformed
- * files are silently skipped, a missing skills dir yields an empty catalog.
- * Never throws.
+ * Collect `SKILL.md` paths under `dir`, descending at most `maxDepth` levels.
+ *
+ * Uses statSync (not the Dirent) so that **symlinked skill directories are
+ * followed**: readdirSync reports a symlink-to-directory as isSymbolicLink(),
+ * never isDirectory(), so a Dirent-based check silently skipped 56 of the 75
+ * entries in ~/.pi/agent/skills — including cognition-router and
+ * thinking-scientific-method. Nested node_modules are pruned so vendored
+ * example skills inside a package's own dependencies don't leak in.
  */
-function scanSkillsCatalog(): GateSkillInput[] {
-  const out: GateSkillInput[] = [];
+function collectSkillFiles(dir: string, maxDepth: number, out: string[]): void {
   let entries: fs.Dirent[];
   try {
-    entries = fs.readdirSync(SKILLS_DIR, { withFileTypes: true });
+    entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch {
-    return out;
+    return;
   }
-
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const skillPath = path.join(SKILLS_DIR, entry.name, "SKILL.md");
+    if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.name === "SKILL.md") {
+      out.push(full);
+      continue;
+    }
+    if (maxDepth <= 0) continue;
+    let isDir = false;
     try {
-      const raw = fs.readFileSync(skillPath, "utf-8");
-      const frontmatter = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-      if (!frontmatter) continue;
-      const fm = frontmatter[1];
-      const nameMatch = fm.match(/^name:\s*(.+?)\s*$/m);
-      const descMatch = fm.match(/^description:\s*(.+?)\s*$/m);
-      if (!nameMatch || !descMatch) continue;
-      out.push({
-        name: nameMatch[1].trim(),
-        description: descMatch[1].trim().slice(0, MAX_SKILL_DESCRIPTION_CHARS),
-      });
+      isDir = fs.statSync(full).isDirectory(); // follows symlinks
     } catch {
-      // Skip unreadable/malformed skill — best-effort catalog.
+      continue; // broken symlink
+    }
+    if (isDir) collectSkillFiles(full, maxDepth - 1, out);
+  }
+}
+
+/**
+ * Build the skill catalog from every root pi can resolve a skill from
+ * (SKILL_ROOTS): the user skills dir, npm packages, git packages, and the
+ * thinking library. Each `SKILL.md` contributes its frontmatter `name:` and
+ * `description:`, with descriptions truncated to MAX_SKILL_DESCRIPTION_CHARS.
+ *
+ * Deduplicated by skill name with earlier roots winning, so a hand-authored
+ * skill shadows a package-provided one. Best-effort throughout:
+ * missing/unreadable/malformed files are skipped and a missing root yields
+ * nothing. Never throws.
+ */
+function scanSkillsCatalog(): GateSkillInput[] {
+  const byName = new Map<string, GateSkillInput>();
+
+  for (const root of SKILL_ROOTS) {
+    const files: string[] = [];
+    // +1 level for the skill's own directory, +1 more for the `skills/`
+    // segment package roots interpose before it.
+    collectSkillFiles(root.dir, root.depth + (root.nested ? 2 : 1), files);
+
+    for (const skillPath of files) {
+      if (root.nested && path.basename(path.dirname(path.dirname(skillPath))) !== root.nested) {
+        continue; // package root: only <pkg>/skills/<name>/SKILL.md counts
+      }
+      try {
+        const raw = fs.readFileSync(skillPath, "utf-8");
+        const frontmatter = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+        if (!frontmatter) continue;
+        const fm = frontmatter[1];
+        const nameMatch = fm.match(/^name:\s*(.+?)\s*$/m);
+        const descMatch = fm.match(/^description:\s*(.+?)\s*$/m);
+        if (!nameMatch || !descMatch) continue;
+        const name = nameMatch[1].trim();
+        if (byName.has(name)) continue; // earlier root wins
+        byName.set(name, {
+          name,
+          description: descMatch[1].trim().slice(0, MAX_SKILL_DESCRIPTION_CHARS),
+        });
+      } catch {
+        // Skip unreadable/malformed skill — best-effort catalog.
+      }
     }
   }
-  return out;
+
+  return [...byName.values()];
 }
 
 // ---------------------------------------------------------------------------

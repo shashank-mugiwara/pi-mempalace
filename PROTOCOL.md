@@ -53,6 +53,53 @@ When a request depends on prior context:
   `memory_check_duplicate`, `memory_delete`). One evolving fact = one memory, not a trail
   of contradicting ones.
 
+## Prospective memory: the `session-resume` record
+
+Episodic memories record *what happened*; the KG records *what is true*. Neither
+answers **"what was I in the middle of?"** — the question that actually costs a
+session when it goes unanswered. That is the `session-resume` record.
+
+**Exactly one per project, superseded rather than appended.** A trail of stale
+hand-offs is worse than none: the agent cannot tell which is current.
+
+Write one when work reaches a stopping point — end of session, context about to
+compact, a branch parked mid-change, or a hand-off to another agent:
+
+```sh
+# 1. find the existing record (there is at most one)
+node cli/mempalace.mjs recall --project P --topic session-resume -n 1 --json
+# 2. delete it by id — supersede, never accumulate
+node cli/mempalace.mjs forget <id>
+# 3. write the new one
+node cli/mempalace.mjs save "<hand-off>" --project P --topic session-resume --importance 0.75
+```
+
+pi equivalents: `memory_recall` → `memory_delete` → `memory_save`.
+
+**Always `--topic session-resume`** — that exact string is what
+`wakeup()` keys on. **Always `--project`**, matching the canonical project name,
+because the record is injected only for the repo you are sitting in.
+
+Content — write it for a stranger resuming cold, and keep it under ~800 chars so
+it survives as a single chunk:
+
+- **Goal** — what is being built or fixed, in one line.
+- **State** — what is done and actually verified, versus merely written.
+- **Next** — the single next concrete action.
+- **Where** — the file paths and the branch, so no re-discovery is needed.
+- **Blockers** — failing tests, awaiting review, unanswered questions.
+
+Do **not** put in it: anything derivable from `git status`/`git log` in seconds,
+narration of the session, or a changelog of what was tried. It is a pointer to
+the live frontier, not a diary — the diary is `diary-<agent>`.
+
+**Recall side:** the record is injected automatically into the wake-up context as
+"Where we left off" (fork ≥0.8.3), whole and untruncated, for the current
+project. It is *not* left to semantic auto-recall — "let's continue" is 14
+characters, below `autoRecallMinPromptChars` (30), so prompt-driven recall never
+fires on exactly the prompt that most needs it. Treat the injected record as the
+last hand-off, not live state: verify against current code and git before acting.
+
 ## Saving knowledge-graph facts (`kg-add` / `knowledge_add`)
 
 Use the KG for **structured, temporally-scoped relationships** you'll later query by
