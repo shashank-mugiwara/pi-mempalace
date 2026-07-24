@@ -1,5 +1,53 @@
 # Fork changelog
 
+## 0.8.4 — 2026-07-25 — the gate was dead, and learning from mistakes
+
+**The recall gate had never once succeeded.** `recall-gate.log` since
+2026-07-20: 46 `gate=idle`, 28 `gate=FAILED(fell-closed)`, **zero `gate=ok`**.
+Every invocation logged `unparseable-response:` with nothing after the colon.
+
+Root cause is an observability defect, not a parser one: `complete()` returns
+`stopReason: "error"` with an `errorMessage` and empty content on a failed
+request, and the judge only special-cased `"aborted"`. An errored response fell
+through to the text extraction, produced `""`, and was reported as a parse
+failure — so five days of total outage looked like a model formatting quirk.
+With `failMode: "closed"` the gray zone was silently dropped the whole time and
+recall ran auto-tier-only. The window opens exactly on the v0.8.1 switch of the
+gate model to `openai-codex/gpt-5.4-mini` (`reasoning: true`, capped at
+`GATE_MAX_TOKENS = 300`).
+
+- `stopReason === "error"` now logs `request-failed: <errorMessage> [provider/model]`.
+- Genuine parse failures now log `stop=`, `types=[...]`, `len=` and `maxTokens=`,
+  which separates the three modes that previously logged identically: a
+  reasoning model burning the budget before emitting text, a model replying in
+  prose, and a response with no content at all.
+- `bench/gate-unit.mjs` passed 23/23 throughout, because it mocks the parser and
+  never exercises the live call — noted here so the next reader doesn't trust it
+  as integration coverage.
+
+**Learning from mistakes.** Rejections were the only labelled signal in the
+system and `apply-review` threw them away (`if (reject.includes(item.id))
+continue;`), so the same bad inference could be re-derived from the same
+transcript on every tick.
+
+- `watchdog-rejections.json` (newest-first, capped at 40) records what the human
+  turned down; `gatherContext` scopes them to the candidate's project and
+  `buildPrompt` injects a "previously REJECTED — do not re-propose" block.
+- New `lessons` extraction category: where an agent's *own reasoning* failed,
+  gated on direct evidence (user correction, abandoned approach, false claim,
+  recurrence after a symptom-fix) and requiring a generalisable trigger.
+  Stored trigger-first under topic `lessons` at importance 0.85, so it retrieves
+  when the situation recurs rather than when someone goes looking.
+- Lessons are **always queued for human approval**, never auto-applied at any
+  confidence. A wrong lesson teaches an agent to avoid correct behaviour, and
+  this install already retired auto-capture for writing 83% noise — the fix is
+  not another autonomous writer.
+
+Verified: rejection round-trip (persist → project-scoped prompt injection),
+lesson queued-not-saved with a throwing store, trigger-less lessons dropped,
+approved lesson stored and retrieved at 0.54 on a paraphrased query.
+
+
 ## 0.8.3 — 2026-07-25 — procedural + prospective memory
 
 The palace could recall *what happened* (memories) and *what is true* (KG), but

@@ -17,6 +17,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, existsSync, globSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadRejections } from "./state.mjs";
 
 const FORK = join(homedir(), ".pi", "agent", "pi-mempalace-fork");
 const VAULT = process.env.WATCHDOG_VAULT || join(homedir(), "Desktop", "shashank");
@@ -32,9 +33,18 @@ export const DEFAULTS = {
 // ---------------------------------------------------------------------------
 
 export async function gatherContext(store, candidate) {
-  const ctx = { memories: [], kg: [], obsidian: "", projects: {} };
+  const ctx = { memories: [], kg: [], obsidian: "", projects: {}, rejections: [] };
   try {
     ctx.projects = store.listProjects().projects;
+  } catch {}
+  try {
+    // Proposals a human already turned down. Scoped to this candidate's project
+    // (plus unscoped ones) so the prompt carries relevant corrections, not the
+    // whole history of every project's rejections.
+    const canon = canonicalProject(candidate.project, ctx.projects);
+    ctx.rejections = loadRejections()
+      .filter((r) => !r.project || !canon || r.project === canon)
+      .slice(0, 12);
   } catch {}
   try {
     const probe = candidate.text.slice(0, 400).replace(/\s+/g, " ");
@@ -100,6 +110,9 @@ export function buildPrompt(candidate, ctx) {
   const kg = ctx.kg
     .map((f) => `${f.subject} ${f.predicate} ${f.object}${f.valid_from ? ` [${f.valid_from}→${f.valid_to || ""}]` : ""}`)
     .join("\n");
+  const rejections = (ctx.rejections || [])
+    .map((r) => `- [${r.kind} · ${r.project || "?"}/${r.topic || "?"} · ${String(r.rejected_at).slice(0, 10)}] ${r.gist}`)
+    .join("\n");
 
   return `You are the session-watchdog memory curator for a shared cross-agent memory palace (pi, Claude Code, opencode, codex all read it — bad memory amplifies bad work, so precision beats coverage).
 
@@ -116,7 +129,7 @@ ${memories || "(none found)"}
 ## Existing knowledge-graph facts for this project
 ${kg || "(none)"}
 
-${ctx.obsidian ? "## Obsidian vault context (read-only; human-curated — if it contradicts the session, that is a DOUBT, not an auto-fix)\n" + ctx.obsidian + "\n" : ""}
+${ctx.obsidian ? "## Obsidian vault context (read-only; human-curated — if it contradicts the session, that is a DOUBT, not an auto-fix)\n" + ctx.obsidian + "\n" : ""}${rejections ? "## Previously REJECTED by the human (do not re-propose these)\nA person reviewed each of these and said no. Treat them as corrections to your own judgment: do not re-derive them from this transcript, and if the current delta pushes you toward one of them, that is a signal your reading is wrong — prefer silence or a doubt.\n" + rejections + "\n\n" : ""}
 ## Known canonical project names (reuse EXACT casing; never invent variants)
 ${projectList || "(empty store)"}
 
@@ -129,9 +142,30 @@ ${projectList || "(empty store)"}
 - Supersede, don't duplicate: if the session explicitly makes an existing memory/fact wrong, propose a supersede/invalidation with the evidence quote. If you are not CERTAIN, put it in doubts instead.
 - If the delta contains nothing worth remembering, return empty arrays — that is a good answer.
 
+## Lessons (the agent got something wrong)
+
+Ordinary memories record what is true. A LESSON records where an agent's own
+reasoning failed, so the next session does not repeat it. Extract one only from
+DIRECT evidence in this transcript — never from your own opinion of the work.
+
+Qualifying evidence:
+- The human corrected the agent ("no", "that's wrong", "I already told you", "stop doing X").
+- An approach was tried, failed, and was abandoned for a different one.
+- A confident claim the agent made turned out to be false.
+- The same error recurred after a fix — the first fix addressed a symptom.
+
+NOT lessons: ordinary iteration, the human changing their mind, a plan evolving,
+tests failing once and being fixed, or anything you merely suspect was suboptimal.
+
+Each lesson: what was believed or done, what was actually right, and the
+generalisable trigger ("when X, check Y first") — useless without the trigger.
+A wrong lesson is worse than no lesson: it teaches an agent to avoid correct
+behaviour. If unsure, emit nothing.
+
 ## Output — STRICT JSON only, no markdown fences, no commentary:
 {
   "memories":        [{"content": str, "project": str, "topic": str, "importance": num}],
+  "lessons":         [{"content": str, "project": str, "trigger": str, "evidence": str, "confidence": "high"|"low"}],
   "kg_facts":        [{"subject": str, "predicate": str, "object": str, "project": str, "from": "YYYY-MM-DD"}],
   "supersedes":      [{"forget_memory_id": str, "replacement_content": str, "project": str, "topic": str, "importance": num, "evidence": str, "confidence": "high"|"low"}],
   "kg_invalidations":[{"subject": str, "predicate": str, "object": str, "replacement": {"subject": str, "predicate": str, "object": str, "project": str, "from": "YYYY-MM-DD"} | null, "evidence": str, "confidence": "high"|"low"}],

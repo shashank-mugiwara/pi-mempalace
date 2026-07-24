@@ -49,6 +49,36 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
     counts.saved++;
   }
 
+  // Lessons are ALWAYS queued, never auto-applied — even at high confidence.
+  // A wrong lesson teaches an agent to avoid correct behaviour, so it is more
+  // damaging than a wrong fact, and the model is inferring it about its own
+  // reasoning from a transcript it partly wrote. This install already killed
+  // auto-capture for writing 83% noise; a new autonomous writer is not the
+  // shape of the fix. The human is the gate.
+  for (const l of result.lessons || []) {
+    if (!l?.content || typeof l.content !== "string") continue;
+    if (!l?.trigger) continue; // a lesson with no trigger is unactionable
+    if (await isNearDuplicate(store, l.content)) {
+      counts.dup_skipped++;
+      continue;
+    }
+    queueReview(
+      reviewItems,
+      "lesson",
+      {
+        content: l.content.trim(),
+        project: canonicalProject(l.project || candidate.project, projects),
+        topic: "lessons",
+        trigger: String(l.trigger).trim(),
+        importance: 0.85,
+        confidence: l.confidence || "low",
+      },
+      l.evidence || "",
+      candidate.key
+    );
+    counts.queued++;
+  }
+
   for (const f of result.kg_facts) {
     if (!f?.subject || !f?.predicate || !f?.object) continue;
     if (!dry) {

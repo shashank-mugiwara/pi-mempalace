@@ -517,8 +517,11 @@ function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGate
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), config.autoRecallGateTimeoutMs);
       let responseText = "";
+      // Hoisted out of the try: the diagnostics after the parse need the stop
+      // reason and content types, not just the extracted text.
+      let response: any;
       try {
-        const response = await complete(
+        response = await complete(
           model,
           {
             systemPrompt: system,
@@ -542,6 +545,19 @@ function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGate
           logGateError(`aborted (timeout ${config.autoRecallGateTimeoutMs}ms)`);
           return null;
         }
+        // A failed request returns stopReason "error" with an errorMessage and
+        // empty content. Falling through to the text extraction below turns it
+        // into an empty string, which the parser rejects and the caller logs as
+        // "unparseable-response:" with nothing after the colon — indistinguishable
+        // from a malformed reply. That mislabelling hid a total gate outage
+        // (0 successes, 28 failures, 2026-07-20 onward) behind a parser symptom.
+        if (response.stopReason === "error") {
+          logGateError(
+            `request-failed: ${(response as any).errorMessage || "(no errorMessage)"} ` +
+              `[${config.autoRecallGateProvider}/${config.autoRecallGateModel}]`
+          );
+          return null;
+        }
         responseText = (response.content ?? [])
           .filter((c: any) => c && c.type === "text" && typeof c.text === "string")
           .map((c: any) => c.text)
@@ -555,7 +571,17 @@ function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGate
       const validSkills = (input.skills ?? []).map((s) => s.name);
       const verdict = parseGateResponse(responseText, validKeys, validSkills);
       if (verdict === null) {
-        logGateError(`unparseable-response: ${responseText.slice(0, 160).replace(/\n/g, " ")}`);
+        // stop reason and content types distinguish the failure modes that all
+        // used to log identically: a reasoning model burning the token budget
+        // before emitting text (stop=max_tokens, types=thinking), a model
+        // replying with prose instead of JSON (types=text, non-empty body),
+        // and a response carrying no content at all (types empty).
+        const types = (response.content ?? []).map((c: any) => c?.type).join("|") || "none";
+        logGateError(
+          `unparseable-response stop=${response.stopReason} types=[${types}] ` +
+            `len=${responseText.length} maxTokens=${GATE_MAX_TOKENS}: ` +
+            `${responseText.slice(0, 160).replace(/\n/g, " ")}`
+        );
       }
       return verdict;
     } catch (error) {

@@ -100,6 +100,46 @@ characters, below `autoRecallMinPromptChars` (30), so prompt-driven recall never
 fires on exactly the prompt that most needs it. Treat the injected record as the
 last hand-off, not live state: verify against current code and git before acting.
 
+## Learning from mistakes: the `lessons` topic
+
+A memory records what is true. A **lesson** records where an agent's own
+reasoning failed, so the next session doesn't repeat it. Without a home of its
+own, this signal gets filed as an ordinary "finding" and becomes unretrievable
+by the only question that matters — *"what have I got wrong here before?"*
+
+**Topic is always `lessons`.** Importance 0.85. Content is **trigger-first**,
+because a lesson is retrieved when the situation recurs, not when someone goes
+looking for it:
+
+```
+LESSON (when <situation recurs>, <do this first>)
+<what was believed or done, and what was actually right>
+```
+
+Write one only from direct evidence: the user corrected the agent; an approach
+was tried, failed and was abandoned; a confident claim turned out false; the
+same error recurred after a fix that only addressed a symptom. **Not** lessons:
+ordinary iteration, the user changing their mind, a test failing once, or
+anything merely suspected to be suboptimal.
+
+A lesson with no generalisable trigger is unactionable — don't save it. And a
+*wrong* lesson is worse than none: it teaches an agent to avoid correct
+behaviour. When unsure, save nothing.
+
+### The rejection loop (watchdog ≥0.8.4)
+
+`apply-review --reject` used to discard rejected proposals. Rejections are the
+only **labelled** signal the system gets — a human judging a concrete inference
+wrong — so they are now persisted to `watchdog-rejections.json` and injected
+into the curator prompt as "previously rejected, do not re-propose". Without
+this, the same bad inference is re-derived from the same transcript on every
+tick and the loop never converges.
+
+Lessons proposed by the watchdog are **always queued for human approval**, never
+auto-applied, regardless of confidence — the model is inferring about its own
+reasoning from a transcript it partly wrote, and this install already retired
+auto-capture for writing 83% noise. The human is the gate.
+
 ## Saving knowledge-graph facts (`kg-add` / `knowledge_add`)
 
 Use the KG for **structured, temporally-scoped relationships** you'll later query by

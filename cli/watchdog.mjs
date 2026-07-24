@@ -29,7 +29,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  MEM_HOME, loadState, saveState, loadReview, saveReview,
+  MEM_HOME, loadState, saveState, loadReview, saveReview, recordRejections,
   acquireLock, releaseLock, log, REVIEW_PATH,
 } from "../watchdog/state.mjs";
 import { collectAll, seedNewSources } from "../watchdog/collectors.mjs";
@@ -159,8 +159,16 @@ async function cmdApplyReview(opts) {
   const review = loadReview();
   const store = new MemoryStore();
   const keep = [];
+  const rejected = [];
   for (const item of review) {
-    if (reject.includes(item.id)) continue;
+    if (reject.includes(item.id)) {
+      // Rejections used to be dropped here. They are the only labelled signal
+      // the system gets — a human judging a concrete proposal wrong — so they
+      // are persisted and fed back into the curator prompt, which is what stops
+      // the same inference being re-derived from the same transcript next tick.
+      rejected.push(item);
+      continue;
+    }
     if (!approve.includes(item.id)) {
       keep.push(item);
       continue;
@@ -175,6 +183,17 @@ async function cmdApplyReview(opts) {
           topic: s.topic || "session-watchdog",
           source: "session-watchdog:review-approved",
           importance: Number(s.importance) || 0.7,
+        });
+      } else if (item.kind === "lesson") {
+        const l = item.payload;
+        // Trigger first: a lesson is retrieved when the situation recurs, so
+        // the "when X, check Y" line has to carry the searchable wording.
+        await store.store({
+          content: `LESSON (${l.trigger})\n${l.content.trim()}`,
+          project: l.project || "general",
+          topic: "lessons",
+          source: "session-watchdog:lesson-approved",
+          importance: Number(l.importance) || 0.85,
         });
       } else if (item.kind === "kg_invalidate") {
         const inv = item.payload;
@@ -200,6 +219,13 @@ async function cmdApplyReview(opts) {
     }
   }
   saveReview(keep);
+  recordRejections(rejected);
+  if (rejected.length) {
+    console.log(
+      `rejected: ${rejected.length} recorded to watchdog-rejections.json ` +
+        `(fed back into the curator prompt so they are not re-proposed)`
+    );
+  }
   console.log(`queue: ${keep.length} remaining`);
 }
 
