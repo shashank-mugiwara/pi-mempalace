@@ -439,6 +439,32 @@ const GATE_MAX_TOKENS = 300;
 const GATE_TEMPERATURE = 0;
 
 /**
+ * Providers whose API rejects `temperature` outright (400) instead of ignoring
+ * it. Seeded with the known offender and extended at runtime the first time a
+ * provider rejects the parameter, so swapping the gate model can never
+ * silently reintroduce a total recall outage.
+ *
+ * Background: openai-codex/gpt-5.4-mini answers every request carrying
+ * `temperature` with "Unsupported parameter: temperature". Combined with
+ * autoRecallGateFailMode "closed" that produced a permanent, invisible outage —
+ * every gray-zone candidate discarded on every prompt, for weeks. The log line
+ * `gate=FAILED(fell-closed) gray=12 auto=0` is twelve relevant memories thrown
+ * away on a single turn.
+ *
+ * Dropping the parameter costs determinism, not correctness: the gate parser
+ * rejects malformed verdicts anyway, and reasoning-family models ignore
+ * temperature even where they accept it.
+ */
+const PROVIDERS_REJECTING_TEMPERATURE = new Set<string>(["openai-codex"]);
+
+/** Does this provider error read as a rejection of the temperature parameter? */
+function isTemperatureRejection(errorMessage: string | undefined): boolean {
+  return /unsupported parameter[^\n]*temperature|temperature[^\n]*(not supported|unsupported|invalid)/i.test(
+    errorMessage ?? ""
+  );
+}
+
+/**
  * Build the judge closure selectRecallRerank calls for gray-zone candidates.
  * Follows the exact pattern verified against
  * ~/.pi/agent/extensions/memory-summarizer.ts: resolve the model via
@@ -521,26 +547,47 @@ function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGate
       // reason and content types, not just the extracted text.
       let response: any;
       try {
-        response = await complete(
-          model,
-          {
-            systemPrompt: system,
-            messages: [
-              {
-                role: "user" as const,
-                content: [{ type: "text" as const, text: user }],
-                timestamp: Date.now(),
-              },
-            ],
-          },
-          {
-            apiKey: auth.apiKey,
-            headers: auth.headers,
-            signal: controller.signal,
-            maxTokens: GATE_MAX_TOKENS,
-            temperature: GATE_TEMPERATURE,
-          } as any,
-        );
+        const request = {
+          systemPrompt: system,
+          messages: [
+            {
+              role: "user" as const,
+              content: [{ type: "text" as const, text: user }],
+              timestamp: Date.now(),
+            },
+          ],
+        };
+        const callGate = (withTemperature: boolean) =>
+          complete(
+            model,
+            request,
+            {
+              apiKey: auth.apiKey,
+              headers: auth.headers,
+              signal: controller.signal,
+              maxTokens: GATE_MAX_TOKENS,
+              ...(withTemperature ? { temperature: GATE_TEMPERATURE } : {}),
+            } as any,
+          );
+
+        const provider = config.autoRecallGateProvider;
+        const sentTemperature = !PROVIDERS_REJECTING_TEMPERATURE.has(provider);
+        response = await callGate(sentTemperature);
+
+        // Self-healing: record the provider so every later call skips the
+        // parameter, and retry this call immediately rather than losing it.
+        // Without the retry, the first prompt after any gate-model swap still
+        // falls closed — which is exactly how the original outage went unnoticed.
+        if (
+          sentTemperature &&
+          response.stopReason === "error" &&
+          isTemperatureRejection((response as any).errorMessage)
+        ) {
+          PROVIDERS_REJECTING_TEMPERATURE.add(provider);
+          logGateError(`temperature rejected by ${provider} — retrying without it (permanent for this session)`);
+          response = await callGate(false);
+        }
+
         if (response.stopReason === "aborted") {
           logGateError(`aborted (timeout ${config.autoRecallGateTimeoutMs}ms)`);
           return null;
