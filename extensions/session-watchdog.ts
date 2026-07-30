@@ -89,12 +89,35 @@ export default function (pi: ExtensionAPI) {
     const pending = pendingReviewCount();
     if (pending === 0 || reviewNoticeShown) return;
     reviewNoticeShown = true;
+    // Playbook items (docs/design/watchdog-playbook.md, Task 3) get a
+    // different treatment from everything else: the live agent tries its own
+    // judgment first (it has vault-write competence apply.mjs deliberately
+    // doesn't), and only falls back to asking the user if it's itself unsure.
+    // Trust-boundary note: this is a genuinely new class of write for this
+    // codebase (LLM-inferred, LLM-approved, LLM-committed, human never in the
+    // loop by default) — the audit log + unconditional user notice below are
+    // required mitigations, not optional polish.
     const extra =
       `\n\n## Memory review pending (session-watchdog)\n` +
-      `${pending} curation item(s) from the background session-watchdog await the user's verdict ` +
-      `(destructive changes and doubts are never auto-applied). At the next natural pause — not mid-task — ` +
-      `list them with \`node ${WATCHDOG} review --json\`, walk the user through each with the AskUserQuestion tool ` +
-      `(one item per question: show the evidence, recommend accept or reject), then run ` +
+      `${pending} curation item(s) from the background session-watchdog await review. List them with ` +
+      `\`node ${WATCHDOG} review --json\`.\n\n` +
+      `For items with kind "playbook": these are procedural findings (command preferences, file/skill ` +
+      `locations, prompt phrasings that worked). Use YOUR OWN judgment first:\n` +
+      `- "location" or "command" entries are informational — they belong in the project's Obsidian HUB NOTE ` +
+      `(Projects/<Project>/<Project>.md), never in Rules.md.\n` +
+      `- "prompt-phrasing" entries are behavior-shaping — they belong in the project's Rules.md ONLY if you ` +
+      `are confident they generalize; Rules.md is injected verbatim on every single turn, so a low-confidence ` +
+      `guess there is far more costly than one in a hub note. If unsure which file, default to the hub note.\n` +
+      `- Append a line to \`~/.pi/agent/memory/playbook-vault.log\` (timestamp, project, file, one-line summary) ` +
+      `for every vault write you make this way — required, not optional, since this write path has no human ` +
+      `in the loop by default.\n` +
+      `- ALWAYS tell the user, in your normal response, what you just added and where ("I added <X> to ` +
+      `<file> based on a session-watchdog finding") — unconditionally, not only when you're unsure.\n` +
+      `Then run \`node ${WATCHDOG} apply-review --approve <id>\` to clear it from the queue. Use AskUserQuestion ` +
+      `instead of writing it yourself if you are genuinely unsure where it belongs or whether it's accurate.\n\n` +
+      `For every other kind (destructive changes, lessons, doubts): never auto-apply. At the next natural ` +
+      `pause — not mid-task — walk the user through each with the AskUserQuestion tool (one item per ` +
+      `question: show the evidence, recommend accept or reject), then run ` +
       `\`node ${WATCHDOG} apply-review --approve <ids> --reject <ids>\`.\n`;
     return { systemPrompt: event.systemPrompt + extra };
   });
