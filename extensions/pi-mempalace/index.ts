@@ -785,6 +785,14 @@ async function showStatsOverlay(
 // ---------------------------------------------------------------------------
 
 export default function memoryExtension(pi: ExtensionAPI) {
+  // Recursion guard for the memory_investigate tool (docs/design/memory-investigate.md,
+  // Task 1): set on the headless `pi -p` child it spawns. When true, this process IS
+  // that child — it must never register memory_investigate itself (which would let the
+  // child re-invoke itself, a fork bomb) and must skip the wake-up/taxonomy injections
+  // (irrelevant single-shot noise for an investigator). memory_search/memory_recall/
+  // knowledge_query/memory_taxonomy stay registered unconditionally — the child needs them.
+  // Precedent: hooks/claude-first-prompt-explorer.mjs's MEMPALACE_EXPLORER=1 guard.
+  const isInvestigatorChild = process.env.MEMPALACE_INVESTIGATOR === "1";
   const runtimeStore = createRuntimeStore();
   const getSessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId();
   const getRuntime = (ctx: ExtensionContext): MemoryRuntime =>
@@ -954,14 +962,20 @@ export default function memoryExtension(pi: ExtensionAPI) {
       "Use `knowledge_invalidate` to mark facts as no longer true. Use `knowledge_timeline` for chronological history.\n" +
       "Use `memory_diary_write` to record reflections. Use `memory_diary_read` to review past entries.\n" +
       "Use `memory_delete` to remove specific memories. Use `memory_check_duplicate` before storing.\n";
-    if (runtime.config.wakeUpEnabled && runtime.wakeUpText) {
-      extra += "\n" + runtime.wakeUpText;
-    }
+    // Investigator children (see recursion guard, top of this function) get
+    // none of the wake-up digest / taxonomy index — irrelevant noise for a
+    // single-shot investigation, and injecting them here risked the child
+    // seeing prior-session content unrelated to the query it was spawned for.
+    if (!isInvestigatorChild) {
+      if (runtime.config.wakeUpEnabled && runtime.wakeUpText) {
+        extra += "\n" + runtime.wakeUpText;
+      }
 
-    // Taxonomy: compact map of what projects/topics exist — lets the model
-    // know WHERE to look without having to call memory_taxonomy first.
-    if (runtime.config.taxonomyEnabled && runtime.taxonomyText) {
-      extra += "\n\n" + runtime.taxonomyText;
+      // Taxonomy: compact map of what projects/topics exist — lets the model
+      // know WHERE to look without having to call memory_taxonomy first.
+      if (runtime.config.taxonomyEnabled && runtime.taxonomyText) {
+        extra += "\n\n" + runtime.taxonomyText;
+      }
     }
 
     const result: {
@@ -970,7 +984,10 @@ export default function memoryExtension(pi: ExtensionAPI) {
     } = { systemPrompt: event.systemPrompt + extra };
 
     // Auto-recall: retrieval must not depend on the model deciding to search.
-    if (runtime.config.autoRecall) {
+    // Skipped entirely for investigator children — their whole purpose IS a
+    // manual investigation; stacking the legacy per-turn gate on top of that
+    // would double a gate call for no benefit on a single-shot -p process.
+    if (runtime.config.autoRecall && !isInvestigatorChild) {
       const query = (event.prompt || "").trim();
       if (query.length >= runtime.config.autoRecallMinPromptChars) {
         try {
