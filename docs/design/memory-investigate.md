@@ -74,6 +74,17 @@ pi -p "<query>" --no-extensions \
 | Memory tools only | 26.6s |
 | + `mcp` gateway (Obsidian via `npx @bitbonsai/mcpvault@latest`) | 62.6s |
 
+**Superseded during implementation (2026-07-30):** the numbers above used
+simple direct-question prompts with no investigator framing, to isolate
+spawn/MCP overhead. The REAL `buildChildPrompt()` (Task 2) — which asks the
+model to actually search both memory and vault and reason about confidence —
+measured **~170s** end-to-end on a genuinely ambiguous query during Task 2's
+smoke test. `runInvestigation`'s default timeout was raised 90s→180s
+accordingly. Treat 170s, not 62s, as the realistic per-call cost when
+reasoning about UX/frequency — the earlier "latency accepted as-is" decision
+still stands (per the user), but on a bigger number than was shown at the
+time.
+
 Findings that changed the implementation plan:
 - **`--mode json` is not usable for parsing.** It only streams terse
   lifecycle events (`{"type":"agent_settled"}`) — no final assistant text.
