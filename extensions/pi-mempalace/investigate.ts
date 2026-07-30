@@ -146,11 +146,16 @@ const FORK = join(homedir(), ".pi", "agent", "pi-mempalace-fork");
 const MCP_ADAPTER = join(homedir(), ".pi", "agent", "npm", "node_modules", "pi-mcp-adapter", "index.ts");
 const MEMPALACE_EXT = join(FORK, "extensions", "pi-mempalace", "index.ts");
 
-/** Raised from the design doc's original 90s to 180s after the real (not
- * spike-simplified) child prompt measured ~170s end-to-end on a genuinely
- * ambiguous, multi-tool query — 90s was cutting it too close to the actual
- * distribution's tail, not just its median. */
-const DEFAULT_TIMEOUT_MS = 180_000;
+/** Raised twice during implementation smoke-testing (90s -> 180s -> 240s).
+ * The doc's original spike (~27-63s) used simple queries with no investigator
+ * framing. The real buildChildPrompt() measured ~137-170s on working queries,
+ * but 2 of 3 real end-to-end tests against "recall gate design"-style queries
+ * (broad, needing both memory AND vault search) hit the 180s ceiling and were
+ * killed mid-investigation, falling back to legacy recall instead of
+ * completing — the fail-open path worked correctly, but the real
+ * tool-using investigation silently degraded more often than expected.
+ * 240s gives real headroom above the observed ~180s tail. */
+const DEFAULT_TIMEOUT_MS = 240_000;
 
 /**
  * Spawn a restricted headless `pi -p` child to investigate `input.query`.
