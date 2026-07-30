@@ -175,6 +175,12 @@ interface MemoryRuntime {
   investigationFindings: string[];
   /** Soft rate-cap counter for memory_investigate — logs past a threshold, never blocks (Task 3). */
   investigationCallsThisSession: number;
+  /** Session-scoped verdict cache keyed by normalizeInvestigateQuery(query). A near-identical
+   * query re-asked minutes later (observed in recall-gate.log: two ~170s spawns 7 minutes apart
+   * for the same underlying question) is a pure perf loss — the answer can't have changed within
+   * one session. Never expires within the session; cleared with the rest of MemoryRuntime on
+   * session_shutdown. */
+  investigationCache: Map<string, InvestigateVerdict>;
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +376,7 @@ function createRuntime(): MemoryRuntime {
     skillsCatalog: null,
     investigationFindings: [],
     investigationCallsThisSession: 0,
+    investigationCache: new Map(),
   };
 }
 
@@ -661,6 +668,37 @@ const INVESTIGATE_LOG = path.join(MEMORY_DIR, "investigate.log");
 function pushFinding(runtime: MemoryRuntime, summary: string) {
   runtime.investigationFindings.push(summary.slice(0, 500));
   if (runtime.investigationFindings.length > 3) runtime.investigationFindings.shift();
+}
+
+/** Cache key for investigationCache — collapses whitespace/case so trivially-reworded
+ * repeat queries ("What did we decide about X" vs "what did we decide about X?") still hit. */
+function normalizeInvestigateQuery(query: string): string {
+  return query.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/** Render an InvestigateVerdict into the same tool-result shape whether it just came off a
+ * fresh spawn or a session-cache hit — single source of truth for the two call sites. */
+function formatVerdictResult(verdict: InvestigateVerdict, query: string) {
+  if (!verdict.confident) {
+    return textResult(
+      "Investigation was not confident enough to pick automatically. Ask the user via " +
+        "ask_user_question using this, then call memory_investigate again with the clarified query:\n\n" +
+        JSON.stringify(verdict.options, null, 2)
+    );
+  }
+
+  if (verdict.items.length === 0) {
+    return textResult(`No relevant memory or vault context found for: "${query}"`);
+  }
+
+  let text = `Investigation found ${verdict.items.length} relevant item(s):\n\n`;
+  for (const item of verdict.items) {
+    text += `[${item.source} · ${item.project}/${item.topic}]\n${item.text}\n\n---\n\n`;
+  }
+  if (verdict.skills.length > 0) {
+    text += `Possibly relevant skills: ${verdict.skills.join(", ")} (load if applicable).\n`;
+  }
+  return textResult(text, { query, itemCount: verdict.items.length });
 }
 
 /** Soft cap only — logs and lets the call through, never blocks ("fail open,
@@ -1096,10 +1134,11 @@ export default function memoryExtension(pi: ExtensionAPI) {
       "\n\n## Agent Memory (ACTIVE)\n" +
       "You have persistent memory across sessions. Previous conversations and decisions are stored and searchable.\n" +
       (preferInvestigate
-        ? "Use `memory_investigate(query)` to gather relevant memory+vault context — call it on the first " +
-          "substantive message of a session and whenever you need memory context; prefer it over " +
-          "memory_search for context-gathering (memory_search is a fast raw similarity list; " +
-          "memory_investigate is a judged, curated investigation with vault access, though slower). \n"
+        ? "`memory_investigate(query)` gathers judged memory+vault context via a real tool-using search, " +
+          "but it is slow (roughly 1-4 minutes, a real spawned agent turn) — use `memory_search` first " +
+          "(fast, seconds) and only reach for memory_investigate when memory_search comes back empty or " +
+          "clearly insufficient and the task genuinely depends on prior-session or vault context. Do not " +
+          "call it reflexively on every message.\n"
         : "") +
       "Use `memory_search` to find past context. Use `memory_save` to explicitly remember something important.\n" +
       "Use `memory_recall` to browse memories for a specific project or topic.\n" +
@@ -1276,13 +1315,14 @@ export default function memoryExtension(pi: ExtensionAPI) {
       label: "Memory Investigate",
       description:
         "Investigate the memory palace AND Obsidian vault for context relevant to a query, using a " +
-        "real tool-using search (not just similarity ranking). Prefer this over memory_search when " +
-        "you need curated, judged context rather than a raw similarity list. Slower (roughly 30s-3min) " +
-        "but returns only what actually matters, and can flag when it's genuinely unsure so you can ask " +
-        "the user rather than guess.",
-      promptSnippet: "memory_investigate(query) — agentic memory+vault investigation, prefer over memory_search for context-gathering",
+        "real tool-using search (not just similarity ranking). Much slower than memory_search " +
+        "(roughly 1-4 minutes, real cost) — use it only when memory_search comes back empty or clearly " +
+        "insufficient and the task genuinely depends on prior-session or vault context. Not for routine " +
+        "recall on every message.",
+      promptSnippet: "memory_investigate(query) — slow (1-4min) agentic memory+vault investigation, use only when memory_search misses",
       promptGuidelines: [
-        "Call this on the first substantive message of a session, and whenever you need memory context mid-session — not on every trivial follow-up",
+        "Try memory_search first — it's fast (seconds). Only call this when memory_search returns nothing relevant and the task genuinely needs curated or vault-level context",
+        "At most once per session per topic — a repeat/rephrased query on something already investigated this session is served from cache automatically, but don't call it reflexively on every message regardless",
         "If the result says it was not confident, it will include clarifying options — ask the user via ask_user_question using those options, then call memory_investigate again with the clarified query",
         "Use memory_save/knowledge_add directly to WRITE memory — this tool is search-only",
       ],
@@ -1291,6 +1331,18 @@ export default function memoryExtension(pi: ExtensionAPI) {
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const runtime = getRuntime(ctx);
+
+        // Session-scoped cache: a near-identical query re-asked minutes later
+        // can't have a different answer within one session (recall-gate.log
+        // showed two ~170s spawns 7 minutes apart for the same underlying
+        // question) — skip the spawn entirely on a hit.
+        const cacheKey = normalizeInvestigateQuery(params.query);
+        const cached = runtime.investigationCache.get(cacheKey);
+        if (cached) {
+          logInvestigationRaw(runtime.currentProject, params.query, "cache-hit", 0);
+          return formatVerdictResult(cached, params.query);
+        }
+
         checkRateSoft(runtime);
         const t0 = Date.now();
         const verdict = await runInvestigation({
@@ -1305,41 +1357,26 @@ export default function memoryExtension(pi: ExtensionAPI) {
 
         if (verdict === null) {
           // Fail open — legacy selectRecall path, never return nothing just
-          // because the child process broke.
+          // because the child process broke. Not cached: a broken child this
+          // time shouldn't poison a retry a minute later.
           return await fallbackToLegacyRecall(runtime, params.query, elapsedMs);
         }
 
         logInvestigation(runtime.currentProject, params.query, verdict, elapsedMs, "ok");
+        runtime.investigationCache.set(cacheKey, verdict);
 
         // parseVerdict (investigate.ts) guarantees `options` is populated
         // whenever `confident` is false — including a generic fallback
         // question when the model said it was unsure but gave no usable
         // options — so this must not silently drop the bare confident:false case.
-        if (!verdict.confident) {
-          return textResult(
-            "Investigation was not confident enough to pick automatically. Ask the user via " +
-              "ask_user_question using this, then call memory_investigate again with the clarified query:\n\n" +
-              JSON.stringify(verdict.options, null, 2)
-          );
+        if (verdict.confident && verdict.items.length > 0) {
+          const summary = verdict.items
+            .map((i) => `[${i.source}:${i.project}/${i.topic}] ${i.text.slice(0, 150)}`)
+            .join(" | ");
+          pushFinding(runtime, summary);
         }
 
-        if (verdict.items.length === 0) {
-          return textResult(`No relevant memory or vault context found for: "${params.query}"`);
-        }
-
-        const summary = verdict.items
-          .map((i) => `[${i.source}:${i.project}/${i.topic}] ${i.text.slice(0, 150)}`)
-          .join(" | ");
-        pushFinding(runtime, summary);
-
-        let text = `Investigation found ${verdict.items.length} relevant item(s):\n\n`;
-        for (const item of verdict.items) {
-          text += `[${item.source} · ${item.project}/${item.topic}]\n${item.text}\n\n---\n\n`;
-        }
-        if (verdict.skills.length > 0) {
-          text += `Possibly relevant skills: ${verdict.skills.join(", ")} (load if applicable).\n`;
-        }
-        return textResult(text, { query: params.query, itemCount: verdict.items.length });
+        return formatVerdictResult(verdict, params.query);
       },
       renderResult: renderTextResult,
     });
