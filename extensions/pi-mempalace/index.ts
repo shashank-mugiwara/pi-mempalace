@@ -39,6 +39,7 @@ import { localToday, MemoryStore } from "./memory_store.js";
 import { selectRecall, type GateJudgeInput, type RecallGateOptions, type RecallResult } from "./recall.ts";
 import { warmReranker } from "./reranker.ts";
 import { buildGatePrompt, parseGateResponse, type GateSkillInput, type GateVerdict } from "./gate.ts";
+import { runInvestigation, lastFailureDiagnostic, type InvestigateVerdict } from "./investigate.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -166,6 +167,10 @@ interface MemoryRuntime {
   recalledIds: Set<string>;
   /** Cached skills catalog (name + first-200-chars description) for the LLM gate's skill-suggestion feature, refreshed on session_start when autoRecallGateSuggestSkills is on. */
   skillsCatalog: GateSkillInput[] | null;
+  /** Bounded FIFO of recent memory_investigate findings, folded into later calls' prompts for continuity (docs/design/memory-investigate.md, Task 3). */
+  investigationFindings: string[];
+  /** Soft rate-cap counter for memory_investigate — logs past a threshold, never blocks (Task 3). */
+  investigationCallsThisSession: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +363,8 @@ function createRuntime(): MemoryRuntime {
     store: new MemoryStore(),
     recalledIds: new Set(),
     skillsCatalog: null,
+    investigationFindings: [],
+    investigationCallsThisSession: 0,
   };
 }
 
@@ -638,6 +645,91 @@ function buildGateJudge(ctx: ExtensionContext, config: MemoryConfig): RecallGate
       return null;
     }
   };
+}
+
+// ---------------------------------------------------------------------------
+// memory_investigate helpers (docs/design/memory-investigate.md, Tasks 3-4)
+// ---------------------------------------------------------------------------
+
+const INVESTIGATE_LOG = path.join(MEMORY_DIR, "investigate.log");
+
+function pushFinding(runtime: MemoryRuntime, summary: string) {
+  runtime.investigationFindings.push(summary.slice(0, 500));
+  if (runtime.investigationFindings.length > 3) runtime.investigationFindings.shift();
+}
+
+/** Soft cap only — logs and lets the call through, never blocks ("fail open,
+ * never block" per the design doc's Global Constraints). Every
+ * memory_investigate call is a real billed model turn (measured ~170s on a
+ * genuinely ambiguous query); with no automatic per-turn trigger (recall is
+ * fully agent-judgment-driven), this is the only backstop against a model
+ * re-investigating in a loop on repeated low-confidence results. */
+const INVESTIGATION_SOFT_CAP_PER_SESSION = 15;
+function checkRateSoft(runtime: MemoryRuntime): void {
+  runtime.investigationCallsThisSession++;
+  if (runtime.investigationCallsThisSession === INVESTIGATION_SOFT_CAP_PER_SESSION) {
+    logInvestigationRaw(runtime.currentProject, "(rate-cap-warning)", "soft-cap-reached", 0);
+  }
+}
+
+/** One line per memory_investigate call to ~/.pi/agent/memory/investigate.log,
+ * mirroring recall-gate.log's auditability convention. */
+function logInvestigation(
+  project: string | null,
+  query: string,
+  verdict: InvestigateVerdict,
+  elapsedMs: number,
+  status: string,
+): void {
+  try {
+    fs.appendFileSync(
+      INVESTIGATE_LOG,
+      `${new Date().toISOString()} project=${project ?? "?"} status=${status} confident=${verdict.confident} items=${verdict.items.length} skills=${verdict.skills.length} ms=${elapsedMs} query=${JSON.stringify(query.slice(0, 100))}\n`
+    );
+  } catch {
+    /* logging must never break the tool */
+  }
+}
+
+/** Failure-path logging — includes real diagnostics (exit code + stderr tail)
+ * from investigate.ts's lastFailureDiagnostic, not just "child-failed" +
+ * elapsed ms, so a broken child is debuggable from the log alone. */
+function logInvestigationRaw(project: string | null, query: string, status: string, elapsedMs: number): void {
+  try {
+    const diag = lastFailureDiagnostic;
+    const diagStr = diag ? ` exit=${diag.exitCode} stderr=${JSON.stringify(diag.stderr.slice(0, 300))}` : "";
+    fs.appendFileSync(
+      INVESTIGATE_LOG,
+      `${new Date().toISOString()} project=${project ?? "?"} status=${status} ms=${elapsedMs}${diagStr} query=${JSON.stringify(query.slice(0, 100))}\n`
+    );
+  } catch {
+    /* logging must never break the tool */
+  }
+}
+
+/** Fail-open fallback: on child spawn/timeout/parse failure, fall back to the
+ * legacy selectRecall path (bi-encoder + cross-encoder, gate disabled since
+ * the child already failed once) so memory_investigate never returns nothing
+ * just because the child process broke. */
+async function fallbackToLegacyRecall(runtime: MemoryRuntime, query: string, elapsedMs: number) {
+  logInvestigationRaw(runtime.currentProject, query, "child-failed", elapsedMs);
+  try {
+    const result = await selectRecall(runtime.store, query, {
+      project: runtime.currentProject,
+      excludeIds: new Set(),
+      config: { ...runtime.config, autoRecallLlmGate: false },
+    });
+    if (result.picked.length === 0) {
+      return textResult(`No relevant memory found for: "${query}" (investigation unavailable, fell back to similarity search)`);
+    }
+    let text = `Investigation unavailable — fell back to similarity search. Found ${result.picked.length} candidate(s), unverified:\n\n`;
+    for (const hit of result.picked) {
+      text += `[${hit.project}/${hit.topic}] (${(hit.similarity * 100).toFixed(0)}% match)\n${hit.text}\n\n---\n\n`;
+    }
+    return textResult(text);
+  } catch {
+    return textResult(`No relevant memory found for: "${query}" (investigation and fallback both unavailable)`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1099,6 +1191,84 @@ export default function memoryExtension(pi: ExtensionAPI) {
 
     renderResult: renderTextResult,
   });
+
+  // --- memory_investigate --- (docs/design/memory-investigate.md, Task 3)
+  // Guarded: an investigator child must never register this tool itself —
+  // see the recursion guard at the top of this function.
+  if (!isInvestigatorChild) {
+    pi.registerTool({
+      name: "memory_investigate",
+      label: "Memory Investigate",
+      description:
+        "Investigate the memory palace AND Obsidian vault for context relevant to a query, using a " +
+        "real tool-using search (not just similarity ranking). Prefer this over memory_search when " +
+        "you need curated, judged context rather than a raw similarity list. Slower (roughly 30s-3min) " +
+        "but returns only what actually matters, and can flag when it's genuinely unsure so you can ask " +
+        "the user rather than guess.",
+      promptSnippet: "memory_investigate(query) — agentic memory+vault investigation, prefer over memory_search for context-gathering",
+      promptGuidelines: [
+        "Call this on the first substantive message of a session, and whenever you need memory context mid-session — not on every trivial follow-up",
+        "If the result says it was not confident, it will include clarifying options — ask the user via ask_user_question using those options, then call memory_investigate again with the clarified query",
+        "Use memory_save/knowledge_add directly to WRITE memory — this tool is search-only",
+      ],
+      parameters: Type.Object({
+        query: Type.String({ description: "What to investigate (natural language)" }),
+      }),
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        const runtime = getRuntime(ctx);
+        checkRateSoft(runtime);
+        const t0 = Date.now();
+        const verdict = await runInvestigation({
+          query: params.query,
+          project: runtime.currentProject,
+          // runtime.skillsCatalog is `GateSkillInput[] | null`; InvestigateInput.skills
+          // has no null in its union — `?? undefined` closes that type gap.
+          skills: runtime.config.autoRecallGateSuggestSkills ? (runtime.skillsCatalog ?? undefined) : undefined,
+          priorFindings: runtime.investigationFindings,
+        });
+        const elapsedMs = Date.now() - t0;
+
+        if (verdict === null) {
+          // Fail open — legacy selectRecall path, never return nothing just
+          // because the child process broke.
+          return await fallbackToLegacyRecall(runtime, params.query, elapsedMs);
+        }
+
+        logInvestigation(runtime.currentProject, params.query, verdict, elapsedMs, "ok");
+
+        // parseVerdict (investigate.ts) guarantees `options` is populated
+        // whenever `confident` is false — including a generic fallback
+        // question when the model said it was unsure but gave no usable
+        // options — so this must not silently drop the bare confident:false case.
+        if (!verdict.confident) {
+          return textResult(
+            "Investigation was not confident enough to pick automatically. Ask the user via " +
+              "ask_user_question using this, then call memory_investigate again with the clarified query:\n\n" +
+              JSON.stringify(verdict.options, null, 2)
+          );
+        }
+
+        if (verdict.items.length === 0) {
+          return textResult(`No relevant memory or vault context found for: "${params.query}"`);
+        }
+
+        const summary = verdict.items
+          .map((i) => `[${i.source}:${i.project}/${i.topic}] ${i.text.slice(0, 150)}`)
+          .join(" | ");
+        pushFinding(runtime, summary);
+
+        let text = `Investigation found ${verdict.items.length} relevant item(s):\n\n`;
+        for (const item of verdict.items) {
+          text += `[${item.source} · ${item.project}/${item.topic}]\n${item.text}\n\n---\n\n`;
+        }
+        if (verdict.skills.length > 0) {
+          text += `Possibly relevant skills: ${verdict.skills.join(", ")} (load if applicable).\n`;
+        }
+        return textResult(text, { query: params.query, itemCount: verdict.items.length });
+      },
+      renderResult: renderTextResult,
+    });
+  }
 
   // --- memory_save ---
   pi.registerTool({
