@@ -1225,6 +1225,32 @@ export class MemoryStore {
     return { status: "deleted", id, rows: rows.length };
   }
 
+  /**
+   * Delete the most recent memory for (project, topic), if one exists.
+   * Used by session-watchdog's `playbook` auto-apply path (apply.mjs,
+   * docs/design/watchdog-playbook.md Task 2) to enforce "one per project,
+   * superseded not appended" the same way `session-resume` already does via
+   * `latestResume()` — without this, every qualifying tick would add a new
+   * row forever. Exposed as a public method rather than having callers reach
+   * into `this.db` directly (private by convention, even though TypeScript's
+   * `private` doesn't survive type-stripping into plain JS at runtime).
+   * Best-effort: swallows errors, never throws — a missed supersede just
+   * leaves one extra row, never fatal.
+   */
+  supersedeTopic(project: string, topic: string): { superseded: boolean } {
+    this.ensureLoaded();
+    try {
+      const prior = this.db
+        .prepare(`SELECT id FROM memories WHERE project = ? AND topic = ? ORDER BY timestamp DESC LIMIT 1`)
+        .get(project, topic) as { id: string } | undefined;
+      if (!prior?.id) return { superseded: false };
+      this.delete(prior.id);
+      return { superseded: true };
+    } catch {
+      return { superseded: false };
+    }
+  }
+
   listProjects(): { projects: Record<string, number>; total: number } {
     const { projects, total_memories: total } = this.status();
     return { projects, total };

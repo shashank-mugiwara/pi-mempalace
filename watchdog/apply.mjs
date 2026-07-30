@@ -25,7 +25,7 @@ const DUP_SIMILARITY = 0.92;
 
 export async function applyResult(store, candidate, result, reviewItems, opts = {}) {
   const dry = !!opts.dryRun;
-  const counts = { saved: 0, kg_added: 0, superseded: 0, kg_invalidated: 0, queued: 0, dup_skipped: 0 };
+  const counts = { saved: 0, kg_added: 0, superseded: 0, kg_invalidated: 0, queued: 0, dup_skipped: 0, playbook_saved: 0, playbook_queued: 0 };
   const projects = safeProjects(store);
   const src = `session-watchdog:${candidate.source}`;
 
@@ -77,6 +77,79 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
       candidate.key
     );
     counts.queued++;
+  }
+
+  // Playbook (docs/design/watchdog-playbook.md, Task 2): procedural findings
+  // (fast commands, file/skill locations, prompt phrasings that worked).
+  // Apply policy by (kind, destination):
+  //   command|location + memory + HIGH confidence -> auto-apply, supersede-on-write
+  //   everything else (prompt-phrasing/other, low confidence, vault/both/unsure) -> queue
+  // apply.mjs has NO filesystem access to the Obsidian vault (only ever calls
+  // store.store()/addTriple()/delete() — see the file's own imports/methods),
+  // so any vault-bound destination must be queued for the live agent to apply
+  // with its own judgment (session-watchdog.ts's review notice), never guessed
+  // at here.
+  for (const p of result.playbook || []) {
+    if (!p?.content || typeof p.content !== "string") continue;
+    if (!p?.kind || !p?.destination) continue; // both required to route correctly
+    const project = canonicalProject(p.project || candidate.project, projects);
+
+    const needsVaultRoute = p.destination === "vault" || p.destination === "both" || p.destination === "unsure";
+    const isFactual = p.kind === "command" || p.kind === "location";
+    const highConfidence = p.confidence === "high";
+
+    if (needsVaultRoute || !isFactual || !highConfidence) {
+      // Vault-bound (can't apply here), behavior-shaping (same risk class as
+      // lessons), or not high-confidence (Decision #3 requires HIGH confidence
+      // to auto-apply a factual/memory entry — a low-confidence guess written
+      // straight into the shared store is the exact unreviewed-write failure
+      // mode the 0.3.0 cleanup (4,585/5,527 memories, 83% noise) already paid
+      // down once).
+      if (await isNearDuplicate(store, p.content)) {
+        counts.dup_skipped++;
+        continue;
+      }
+      queueReview(
+        reviewItems,
+        "playbook",
+        {
+          content: p.content.trim(),
+          project,
+          topic: "playbook",
+          kind: p.kind,
+          destination: p.destination,
+          importance: 0.6,
+          confidence: p.confidence || "low",
+        },
+        p.evidence || "",
+        candidate.key
+      );
+      counts.playbook_queued++;
+      continue;
+    }
+
+    // kind is command|location, destination is memory, confidence is high.
+    if (await isNearDuplicate(store, p.content)) {
+      counts.dup_skipped++;
+      continue;
+    }
+    if (!dry) {
+      // Supersede, don't accumulate: one `playbook` memory per project, same
+      // discipline as `session-resume` (PROTOCOL.md) — without this, every
+      // qualifying tick adds a new row forever, refilling the store with the
+      // exact noise pattern 0.3.0 already cleaned up (just differently-worded
+      // restatements of the same procedural fact, which the near-dup guard's
+      // 0.92 threshold doesn't catch).
+      store.supersedeTopic(project, "playbook");
+      await store.store({
+        content: p.content.trim(),
+        project,
+        topic: "playbook",
+        source: `session-watchdog:${candidate.source}`,
+        importance: Math.min(0.7, AUTO_IMPORTANCE_CAP),
+      });
+    }
+    counts.playbook_saved++;
   }
 
   for (const f of result.kg_facts) {

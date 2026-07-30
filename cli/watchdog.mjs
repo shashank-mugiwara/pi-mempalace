@@ -114,7 +114,7 @@ async function cmdTick(opts) {
         saveState(state);
         saveReview(review);
       }
-      const summary = `saved ${counts.saved}, kg+${counts.kg_added}, superseded ${counts.superseded}, kg-inv ${counts.kg_invalidated}, queued ${counts.queued}, dup-skip ${counts.dup_skipped} (${Math.round((Date.now() - t0) / 1000)}s)`;
+      const summary = `saved ${counts.saved}, playbook+${counts.playbook_saved}, kg+${counts.kg_added}, superseded ${counts.superseded}, kg-inv ${counts.kg_invalidated}, queued ${counts.queued + counts.playbook_queued}, dup-skip ${counts.dup_skipped} (${Math.round((Date.now() - t0) / 1000)}s)`;
       log(`applied ${c.source}/${c.project}: ${summary}`);
       console.log(`  ✓ ${c.source}/${c.project}: ${summary}${opts["dry-run"] ? " [DRY RUN — nothing written]" : ""}`);
       if (opts["dry-run"]) console.log(JSON.stringify(run.result, null, 2));
@@ -194,6 +194,21 @@ async function cmdApplyReview(opts) {
           topic: "lessons",
           source: "session-watchdog:lesson-approved",
           importance: Number(l.importance) || 0.85,
+        });
+      } else if (item.kind === "playbook") {
+        const p = item.payload;
+        // Vault write is NOT done here — apply-review is a human/CLI path with
+        // no vault-write competence either (same reason apply.mjs never
+        // auto-applies vault-bound entries). If destination includes "vault",
+        // the human (or the live agent, per session-watchdog.ts's review
+        // notice) writes the note by hand/tool; this only persists the
+        // memory-side copy.
+        await store.store({
+          content: p.content.trim(),
+          project: p.project || "general",
+          topic: "playbook",
+          source: "session-watchdog:playbook-approved",
+          importance: Number(p.importance) || 0.7,
         });
       } else if (item.kind === "kg_invalidate") {
         const inv = item.payload;
