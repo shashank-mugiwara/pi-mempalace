@@ -1020,6 +1020,12 @@ export class MemoryStore {
     const resume = this.latestResume(project);
     if (resume) parts.push(resume);
 
+    // Procedural knowledge from session-watchdog's playbook extraction (fast
+    // commands, file/skill locations, prompt phrasings that worked) — same
+    // one-per-project, superseded-not-appended convention as session-resume.
+    const playbook = this.latestPlaybook(project);
+    if (playbook) parts.push(playbook);
+
     // L1: Essential Story (cached)
     if (this.cachedL1 === null) {
       this.cachedL1 = this.generateL1(project, maxChars);
@@ -1069,6 +1075,38 @@ export class MemoryStore {
       );
     } catch {
       return null; // wake-up context is best-effort; never block startup
+    }
+  }
+
+  /**
+   * Most recent `playbook` memory for `project` — procedural/efficiency
+   * knowledge written by session-watchdog's playbook extraction
+   * (docs/design/watchdog-playbook.md). Unlike `latestResume()`, playbook
+   * entries are never chunked (a single procedural note is short, and
+   * `apply.mjs`'s auto-apply path calls `store.store()` with no chunking
+   * logic), so a plain lookup without chunk-family reassembly is sufficient.
+   * Kept in sync with `MemoryStore.supersedeTopic()`, which apply.mjs calls
+   * before every auto-applied write so this is genuinely one row, not just
+   * the newest of several.
+   */
+  private latestPlaybook(project: string | null): string | null {
+    if (!project) return null;
+    try {
+      const row = this.db
+        .prepare(
+          `SELECT content, timestamp FROM memories
+           WHERE project = ? AND topic = 'playbook'
+           ORDER BY timestamp DESC LIMIT 1`
+        )
+        .get(project) as { content: string; timestamp: string } | undefined;
+      if (!row) return null;
+      return (
+        `## Memory — How to work efficiently on ${project} (updated ${row.timestamp.slice(0, 10)})\n` +
+        `${row.content}\n\n` +
+        `_Procedural notes from session-watchdog, not a live check — verify a command still exists before relying on it._`
+      );
+    } catch {
+      return null;
     }
   }
 
