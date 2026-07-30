@@ -142,6 +142,10 @@ interface MemoryConfig {
   autoRecallGateMaxCandidates: number;
   /** Ask the gate to also suggest up to 2 applicable skills from ~/.pi/agent/skills */
   autoRecallGateSuggestSkills: boolean;
+  /** When true (default), the legacy per-turn autoRecall block is skipped in favor of
+   * the on-demand memory_investigate tool (Task 6). Set false as a one-line rollback
+   * to the old automatic behavior. */
+  investigateEnabled: boolean;
 }
 
 interface MemoryRuntime {
@@ -347,6 +351,7 @@ function defaultConfig(): MemoryConfig {
     autoRecallGateMinScore: 0.15,
     autoRecallGateMaxCandidates: 10,
     autoRecallGateSuggestSkills: true,
+    investigateEnabled: true,
   };
 }
 
@@ -1086,9 +1091,16 @@ export default function memoryExtension(pi: ExtensionAPI) {
     // The instruction block is deliberately NOT gated on wakeUpText: an empty
     // digest (fresh project, wake-up error) must not silently drop the memory
     // tool guidance from the prompt.
+    const preferInvestigate = runtime.config.investigateEnabled && !isInvestigatorChild;
     let extra =
       "\n\n## Agent Memory (ACTIVE)\n" +
       "You have persistent memory across sessions. Previous conversations and decisions are stored and searchable.\n" +
+      (preferInvestigate
+        ? "Use `memory_investigate(query)` to gather relevant memory+vault context — call it on the first " +
+          "substantive message of a session and whenever you need memory context; prefer it over " +
+          "memory_search for context-gathering (memory_search is a fast raw similarity list; " +
+          "memory_investigate is a judged, curated investigation with vault access, though slower). \n"
+        : "") +
       "Use `memory_search` to find past context. Use `memory_save` to explicitly remember something important.\n" +
       "Use `memory_recall` to browse memories for a specific project or topic.\n" +
       "Use `memory_graph` to discover cross-project connections via shared topics.\n" +
@@ -1136,10 +1148,13 @@ export default function memoryExtension(pi: ExtensionAPI) {
     } = { systemPrompt: event.systemPrompt + extra };
 
     // Auto-recall: retrieval must not depend on the model deciding to search.
-    // Skipped entirely for investigator children — their whole purpose IS a
-    // manual investigation; stacking the legacy per-turn gate on top of that
-    // would double a gate call for no benefit on a single-shot -p process.
-    if (runtime.config.autoRecall && !isInvestigatorChild) {
+    // Skipped entirely for investigator children (their whole purpose IS a
+    // manual investigation; stacking the legacy per-turn gate on top would
+    // double a gate call for no benefit on a single-shot -p process) AND
+    // skipped whenever investigateEnabled is on (Task 6: memory_investigate
+    // replaces this path; investigateEnabled:false in config.json is the
+    // one-line rollback to the old always-on behavior).
+    if (runtime.config.autoRecall && !isInvestigatorChild && !runtime.config.investigateEnabled) {
       const query = (event.prompt || "").trim();
       if (query.length >= runtime.config.autoRecallMinPromptChars) {
         try {

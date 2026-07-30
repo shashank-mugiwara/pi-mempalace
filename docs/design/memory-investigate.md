@@ -74,16 +74,25 @@ pi -p "<query>" --no-extensions \
 | Memory tools only | 26.6s |
 | + `mcp` gateway (Obsidian via `npx @bitbonsai/mcpvault@latest`) | 62.6s |
 
-**Superseded during implementation (2026-07-30):** the numbers above used
-simple direct-question prompts with no investigator framing, to isolate
+**Superseded during implementation (2026-07-30), twice:** the numbers above
+used simple direct-question prompts with no investigator framing, to isolate
 spawn/MCP overhead. The REAL `buildChildPrompt()` (Task 2) — which asks the
 model to actually search both memory and vault and reason about confidence —
-measured **~170s** end-to-end on a genuinely ambiguous query during Task 2's
-smoke test. `runInvestigation`'s default timeout was raised 90s→180s
-accordingly. Treat 170s, not 62s, as the realistic per-call cost when
-reasoning about UX/frequency — the earlier "latency accepted as-is" decision
-still stands (per the user), but on a bigger number than was shown at the
-time.
+measured ~137-170s on working test queries, so the timeout was raised
+90s→180s. But 2 of 3 real end-to-end tests against broad queries (needing
+both memory AND vault search) then hit that 180s ceiling and were killed
+mid-investigation, falling back to legacy recall instead of completing —
+confirming the fail-open path works, but showing the real investigation was
+silently degrading more often than expected. Timeout raised again to
+**240s**; re-running the same query that previously timed out completed
+successfully in 222s with `vault_reached: true`.
+
+**Bottom line: treat ~4 minutes, not ~1 minute, as the realistic per-call
+ceiling** for a broad query needing both memory and vault search. The
+"latency accepted as-is" decision still stands (per the user), but the
+actual number has moved twice during implementation and is materially
+bigger than what was shown when that decision was made — worth knowing if
+you revisit the frequency/UX tradeoff later.
 
 Findings that changed the implementation plan:
 - **`--mode json` is not usable for parsing.** It only streams terse
