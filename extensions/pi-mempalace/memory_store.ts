@@ -994,10 +994,24 @@ export class MemoryStore {
    * L1: Top 15 memories by importance + recency, grouped by project.
    *     Generated once per session and cached.
    */
-  wakeup(options?: { project?: string; max_tokens?: number }): WakeupResult {
+  wakeup(options?: { project?: string; projectAliases?: string[]; max_tokens?: number }): WakeupResult {
     this.ensureLoaded();
 
     const project = options?.project || null;
+    // Which project buckets generateL1's digest pulls from. Separate from
+    // `project` above (which stays the single canonical name for identity/
+    // resume/playbook — those are meant to be exactly-scoped, one hand-off
+    // note per real project, never blended). projectAliases exists because
+    // cwd-derived project identity (detectProject = basename(cwd)) and where
+    // memories actually get saved can diverge — e.g. this repo's cwd resolves
+    // to "harness" but most of a session's actual saved content lands under
+    // "pi-config". Config: MemoryConfig.projectAliases (index.ts).
+    const l1Projects =
+      options?.projectAliases && options.projectAliases.length > 0
+        ? options.projectAliases
+        : project
+          ? [project]
+          : null;
     const maxTokens = options?.max_tokens || 800;
     const maxChars = maxTokens * 4;
     const parts: string[] = [];
@@ -1026,9 +1040,33 @@ export class MemoryStore {
     const playbook = this.latestPlaybook(project);
     if (playbook) parts.push(playbook);
 
-    // L1: Essential Story (cached)
+    // Structured facts (knowledge graph), scoped the same way as L1 below —
+    // complements the free-text memory digest with what's formally recorded
+    // as fact (uses/depends_on/decided/etc) rather than narrated. Session-start
+    // is otherwise KG-blind: queryEntity() needs an entity name the agent
+    // doesn't have yet, so without this the KG is only reachable after the
+    // agent already knows what to ask about.
+    if (l1Projects) {
+      const facts = this.projectFacts(l1Projects, 40);
+      if (facts.length > 0) {
+        const factLines = ["## Memory — Known Facts (knowledge graph)"];
+        for (const f of facts) {
+          factLines.push(`- ${f.subject} ${f.predicate} ${f.object}${f.valid_from ? ` (since ${f.valid_from})` : ""}`);
+        }
+        parts.push(factLines.join("\n"));
+      }
+    }
+
+    // L1: Essential Story (cached). Budget is what's left of maxChars after
+    // identity/resume/playbook/facts above — without this, a project with many
+    // KG facts (e.g. prism's 40-fact cap alone runs ~4-5k chars) blows well past
+    // maxChars in total even though L1 itself stays within it; the wake-up budget
+    // is a promise about the WHOLE injected block, not just this one part of it.
+    // Floored at 200 so a fact-heavy project still gets a token L1 line rather
+    // than a negative/zero budget silently producing nothing.
     if (this.cachedL1 === null) {
-      this.cachedL1 = this.generateL1(project, maxChars);
+      const usedChars = parts.join("\n").length;
+      this.cachedL1 = this.generateL1(l1Projects, Math.max(maxChars - usedChars, 200));
     }
     parts.push(this.cachedL1);
 
@@ -1114,7 +1152,7 @@ export class MemoryStore {
    * Generate L1 Essential Story: top 15 memories by importance + recency,
    * grouped by project with compact formatting.
    */
-  private generateL1(project: string | null, maxChars: number): string {
+  private generateL1(project: string[] | null, maxChars: number): string {
     if (this.countAll() === 0) {
       return "\n## Memory — Recent Context\nNo memories stored yet.";
     }
@@ -1122,18 +1160,70 @@ export class MemoryStore {
     // chunk_index = 0 only: continuation chunks inherit their parent's high
     // importance and would surface as mid-word fragments in the wake identity
     // context (live failure 2026-07-07: "serted by both pytest..." led L1).
-    const whereClause = project
-      ? "WHERE project = ? AND chunk_index = 0"
-      : "WHERE chunk_index = 0";
-    const params = project ? [project] : [];
+    if (project && project.length > 0) {
+      // Project-scoped (the common per-session case): ordered by recency, not
+      // importance — the point of a project digest is "what's the latest state
+      // of this project", not "what's ever been most important" (a stale but
+      // once-important row would otherwise permanently occupy a slot a fresher
+      // one should have). LIMIT widened well past the multi-project branch's 15
+      // since this is the ONLY project(s) being shown, not one of many sharing
+      // a budget — and no per-project slice or 200-char truncation either;
+      // maxChars is the sole budget. Per-entry cap raised to 800 (not removed)
+      // so one outsized memory can't eat the whole budget alone.
+      const placeholders = project.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT content, project, topic, timestamp, importance
+           FROM memories WHERE project IN (${placeholders}) AND chunk_index = 0
+           ORDER BY timestamp DESC
+           LIMIT 60`
+        )
+        .all(...project) as MemoryRow[];
+
+      if (rows.length === 0) {
+        return "\n## Memory — Recent Context\nNo memories stored yet for this project.";
+      }
+
+      const byProject: Record<string, MemoryRow[]> = {};
+      for (const row of rows) {
+        const proj = row.project || "general";
+        if (!byProject[proj]) byProject[proj] = [];
+        byProject[proj].push(row);
+      }
+
+      const lines: string[] = ["\n## Memory — Recent Context"];
+      let totalChars = 0;
+      for (const [proj, entries] of Object.entries(byProject).sort()) {
+        if (totalChars > maxChars) break;
+        lines.push(`\n[${proj}]`);
+        for (const row of entries) {
+          let snippet = row.content.trim().replace(/\n/g, " ");
+          if (snippet.length > 800) snippet = snippet.slice(0, 797) + "...";
+          const topic = row.topic || "";
+          const line = topic && topic !== "general" ? `  - [${topic}] ${snippet}` : `  - ${snippet}`;
+          totalChars += line.length;
+          if (totalChars > maxChars) {
+            lines.push("  ... (use memory_search for more)");
+            break;
+          }
+          lines.push(line);
+        }
+      }
+      return lines.join("\n");
+    }
+
+    // No project in scope — global overview across everything, sampled by
+    // importance so a handful of items per project gives a broad sense of
+    // what's stored without any one project dominating. Unchanged from before
+    // project-scoping existed.
     const rows = this.db
       .prepare(
         `SELECT content, project, topic, timestamp, importance
-         FROM memories ${whereClause}
+         FROM memories WHERE chunk_index = 0
          ORDER BY importance DESC, timestamp DESC
          LIMIT 15`
       )
-      .all(...params) as MemoryRow[];
+      .all() as MemoryRow[];
 
     if (rows.length === 0) {
       return "\n## Memory — Recent Context\nNo memories stored yet.";
@@ -1715,6 +1805,34 @@ export class MemoryStore {
       },
       facts,
     };
+  }
+
+  /**
+   * Current (valid_to IS NULL) knowledge-graph facts scoped to project(s),
+   * most recently created first. The KG counterpart to generateL1's free-text
+   * memory digest, injected into wakeup() — without it, session start is
+   * KG-blind: queryEntity() requires an entity name the agent doesn't have
+   * yet, so structured facts are otherwise unreachable until the agent
+   * already knows what to ask about.
+   */
+  projectFacts(
+    projects: string[],
+    limit = 40
+  ): { subject: string; predicate: string; object: string; valid_from: string | null }[] {
+    this.ensureLoaded();
+    if (!projects || projects.length === 0) return [];
+    const placeholders = projects.map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `SELECT s.name as subject, t.predicate, o.name as object, t.valid_from
+         FROM triples t
+         JOIN entities s ON t.subject = s.id
+         JOIN entities o ON t.object = o.id
+         WHERE t.project IN (${placeholders}) AND t.valid_to IS NULL
+         ORDER BY t.created_at DESC
+         LIMIT ?`
+      )
+      .all(...projects, limit) as { subject: string; predicate: string; object: string; valid_from: string | null }[];
   }
 
   /**

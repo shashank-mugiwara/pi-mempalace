@@ -102,6 +102,15 @@ interface MemoryConfig {
   wakeUpEnabled: boolean;
   /** Maximum tokens for wake-up context */
   wakeUpMaxTokens: number;
+  /** Extra project names whose memories get pulled into the wake-up digest alongside the
+   * detected/configured project — keyed by that project name. Exists because cwd-derived
+   * project identity (detectProject = basename(cwd)) and where memories actually get saved
+   * can diverge: this repo's cwd resolves to "harness", but most memory_save calls during a
+   * harness session land under "pi-config" (the established canonical project name for that
+   * content, per the taxonomy). Without an alias, generateL1's project-scoped digest would
+   * show harness's own 15 rows and silently miss pi-config's much larger, more relevant set.
+   * Empty by default — only add an entry where this mismatch is real and known. */
+  projectAliases: Record<string, string[]>;
   /** Default project name (auto-detected from cwd if not set) */
   defaultProject: string | null;
   /** Auto-recall: semantically match each user prompt against the store and inject top hits as a message */
@@ -340,8 +349,13 @@ function defaultConfig(): MemoryConfig {
     // fresh install with no config.json must not silently re-enable it.
     autoCapture: false,
     wakeUpEnabled: true,
-    wakeUpMaxTokens: 800,
+    // 800 (=~3,200 chars) can't hold a whole project's digest — harness alone is
+    // ~8k chars. 2500 (=~10,000 chars) fits a small project whole and lets a large
+    // one (prism, ~170k chars of memories) fill the budget with its most recent
+    // entries and stop cleanly rather than clipping mid-project.
+    wakeUpMaxTokens: 2500,
     defaultProject: null,
+    projectAliases: {},
     autoRecall: true,
     autoRecallMinSimilarity: 0.5,
     autoRecallMaxResults: 4,
@@ -1036,6 +1050,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
       try {
         const wakeup = runtime.store.wakeup({
           project: runtime.currentProject,
+          projectAliases: runtime.config.projectAliases[runtime.currentProject],
           max_tokens: runtime.config.wakeUpMaxTokens,
         });
         runtime.wakeUpText = wakeup.text || null;

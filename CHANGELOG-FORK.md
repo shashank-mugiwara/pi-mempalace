@@ -1,5 +1,75 @@
 # Fork changelog
 
+## 0.8.6 — 2026-07-30 — auto-recall becomes project-scoped, not semantic-search-scoped
+
+**`autoRecall` (the per-message bi-encoder + cross-encoder + Haiku-gate pipeline,
+0.6.0-0.8.5) is now off by default in the live config (`autoRecall: false`),
+replaced by a widened, project-scoped `wakeup()` digest.** Rationale: a fast,
+correctly-working autoRecall call was traced live (2026-07-30, prism session)—
+it fired instantly and returned a real memory, but the memory was topically
+adjacent (docker/ECR naming) rather than actually relevant to the question
+asked (UAT env vars / SSM / prod portability), and the agent's real answer came
+entirely from grepping the actual PR diff and CloudFormation templates — the
+memory was never cited. That, plus the fact that most of this session's actual
+debugging time went into config drift and provider/timeout tuning for the
+gate (see 0.8.5's own changelog entry), motivated a simpler design: instead of
+ranking candidates by semantic similarity to the literal message text across
+EVERY project, inject the current project's OWN memories — grouped, ordered by
+recency, matching how both the memory store and the knowledge graph already
+organize data by project. `memory_search` (explicit semantic search across
+projects) and `memory_investigate` (the subagent-based deep investigation, kept
+exactly as-is per this session's decision — it isolates Obsidian vault content
+in its own context so the main session's context never absorbs a full vault
+crawl) remain available on demand for anything the project digest doesn't cover.
+
+- `generateL1()` (`memory_store.ts`), the function behind `wakeup()`'s project
+  digest, gained a project-scoped branch: `ORDER BY timestamp DESC` (latest,
+  not importance-ranked — a stale-but-once-important row shouldn't permanently
+  occupy a slot a fresher one should have), `LIMIT` widened 15→60, the old
+  5-entries-per-project cap dropped entirely, and the 200-char snippet
+  truncation raised to 800. The original importance-ranked, 5-per-project,
+  200-char-capped behavior is unchanged for the no-project-known case (a
+  genuine cross-project sampler, where those caps still make sense).
+- **`projectAliases: Record<string, string[]>`** (new `MemoryConfig` field,
+  default `{}`). Exists because cwd-derived project identity
+  (`detectProject = basename(cwd)`) and where memories actually get saved can
+  diverge — confirmed live: this repo's cwd resolves to `harness`, which holds
+  only 15 memory rows, while 62 rows of directly relevant content (including
+  everything from this session) are filed under the canonical project name
+  `pi-config`. Without an alias, project-scoped-only injection would have
+  silently shown the 15-row bucket and missed the 62-row one — exactly the
+  failure mode semantic search had been papering over. Configured in
+  `~/.pi/agent/memory/config.json`: `{"harness": ["harness", "pi-config"]}`.
+- **`MemoryStore.projectFacts(projects, limit)`** (new): current
+  (`valid_to IS NULL`) knowledge-graph facts scoped to project(s), most recent
+  first, injected into `wakeup()` right after the playbook block. Session start
+  was otherwise KG-blind — `queryEntity()` requires an entity name the agent
+  doesn't have yet, so structured facts were unreachable until the agent
+  already knew what to ask about.
+- `wakeUpMaxTokens` default raised 800→2500 (in both `defaultConfig()` and the
+  live config — the missing-from-disk-config bug that cost most of this
+  session's earlier debugging is not one to repeat for a new key). 800 tokens
+  (~3,200 chars) can't hold a whole project's digest; `harness` alone is
+  ~8k chars. `wakeup()`'s overall budget accounting was also fixed: the new
+  facts block wasn't previously subtracted from `generateL1`'s budget, so a
+  fact-heavy project (`prism`, 40 facts) blew total output to ~14k chars
+  against a 10k-char (2500-token) target. Fixed by computing `generateL1`'s
+  budget as `maxChars - (identity + resume + playbook + facts already used)`.
+- Verified against the live store (read-only script, `MemoryStore` imported
+  directly, no `store()`/`save()`/`delete()` calls): `harness`+`pi-config`
+  alias lands at 2,438 of 2,500 target tokens with correct grouping and full,
+  untruncated entries; `prism` (251 rows, no alias) now stops cleanly at 2,341
+  tokens instead of spilling to ~3,530.
+
+**Left untouched, on purpose:** `recall.ts`, `gate.ts`, `reranker.ts`, and
+`bench/` — the whole rerank+gate pipeline stays intact and importable
+(`autoRecall: true` is still `defaultConfig()`'s code default, the same
+rollback convention as `investigateEnabled`/`investigateMechanism`), just
+unreferenced from the hot path while `autoRecall: false` is set. `cachedL1`
+stays session-cached, not per-turn — mid-session `memory_save` calls won't
+appear in the injected block until the next session, which is what keeps the
+system-prompt prefix stable and the provider's prompt cache warm.
+
 ## 0.8.5 — 2026-07-30 — memory_investigate: subagent mechanism, and the config bug that made every message slow
 
 **Every per-message context fetch was taking 76-222s.** `investigateEnabled`
