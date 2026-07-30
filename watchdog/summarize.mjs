@@ -162,10 +162,44 @@ generalisable trigger ("when X, check Y first") — useless without the trigger.
 A wrong lesson is worse than no lesson: it teaches an agent to avoid correct
 behaviour. If unsure, emit nothing.
 
+## Playbook (how to work efficiently in this project)
+
+Separate from lessons (which record reasoning failures) and memories (which
+record facts). A playbook entry records a PROCEDURE: a command that was
+faster than the obvious alternative, where a file/skill actually lives (not
+where you'd guess), or a way of phrasing a request that got a better result
+than the first phrasing tried.
+
+Qualifying evidence — extract ONLY from things that actually happened in this
+transcript, never from general knowledge:
+- A command was tried, and a faster/better alternative was used afterward
+  (e.g. switched from find to fffind, from grep to ffgrep).
+- A file or skill's real location differed from where it was first looked
+  for.
+- A prompt/request was rephrased and the rephrasing visibly worked better.
+
+NOT playbook entries: one-off facts with no procedural value, anything
+already covered by a lesson or an ordinary memory, speculation about what
+MIGHT be faster.
+
+For each entry, classify BOTH:
+- kind: "command" (a CLI invocation or tool preference) | "location" (where
+  something lives) | "prompt-phrasing" (a request phrasing that worked) |
+  "other"
+- destination: "memory" (session-scoped procedural fact, fine to auto-apply
+  if high confidence) | "vault" (durable enough to belong in the project's
+  standing rules/hub note, alongside human-curated content) | "both" |
+  "unsure" (you cannot tell — let the destination be decided downstream, not
+  guessed here)
+
+If nothing in this transcript qualifies, return an empty array — that is
+correct far more often than not.
+
 ## Output — STRICT JSON only, no markdown fences, no commentary:
 {
   "memories":        [{"content": str, "project": str, "topic": str, "importance": num}],
   "lessons":         [{"content": str, "project": str, "trigger": str, "evidence": str, "confidence": "high"|"low"}],
+  "playbook":        [{"content": str, "project": str, "kind": "command"|"location"|"prompt-phrasing"|"other", "destination": "memory"|"vault"|"both"|"unsure", "evidence": str, "confidence": "high"|"low"}],
   "kg_facts":        [{"subject": str, "predicate": str, "object": str, "project": str, "from": "YYYY-MM-DD"}],
   "supersedes":      [{"forget_memory_id": str, "replacement_content": str, "project": str, "topic": str, "importance": num, "evidence": str, "confidence": "high"|"low"}],
   "kg_invalidations":[{"subject": str, "predicate": str, "object": str, "replacement": {"subject": str, "predicate": str, "object": str, "project": str, "from": "YYYY-MM-DD"} | null, "evidence": str, "confidence": "high"|"low"}],
@@ -227,6 +261,8 @@ export function extractJson(text) {
 function normalize(o) {
   return {
     memories: Array.isArray(o.memories) ? o.memories : [],
+    lessons: Array.isArray(o.lessons) ? o.lessons : [],
+    playbook: Array.isArray(o.playbook) ? o.playbook : [],
     kg_facts: Array.isArray(o.kg_facts) ? o.kg_facts : [],
     supersedes: Array.isArray(o.supersedes) ? o.supersedes : [],
     kg_invalidations: Array.isArray(o.kg_invalidations) ? o.kg_invalidations : [],
