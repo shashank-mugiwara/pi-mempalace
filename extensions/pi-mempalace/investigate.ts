@@ -43,6 +43,11 @@ export interface InvestigateVerdict {
   items: { project: string; topic: string; text: string; source: "memory" | "vault" }[];
   skills: string[];
   options?: { text: string; choices: string[] }[]; // present only when confident=false
+  /** Whether the child actually got a response from the obsidian MCP tool
+   * (even an empty one) — false if it errored, timed out, or was never
+   * called. Defaults to false on absent/malformed field: fail toward
+   * "flag as blind" rather than "assume it worked" (Task 5). */
+  vault_reached: boolean;
 }
 
 /** Set by the most recent failed runInvestigation() call; read by index.ts's
@@ -87,7 +92,11 @@ function buildChildPrompt(input: InvestigateInput): string {
   lines.push("");
   lines.push("End your response with STRICT JSON on its own line, no markdown fence:");
   lines.push(
-    '{"confident": bool, "items": [{"project": str, "topic": str, "text": str, "source": "memory"|"vault"}], "skills": [str], "options": [{"text": str, "choices": [str]}]}'
+    '{"confident": bool, "items": [{"project": str, "topic": str, "text": str, "source": "memory"|"vault"}], "skills": [str], "options": [{"text": str, "choices": [str]}], "vault_reached": bool}'
+  );
+  lines.push(
+    "Set vault_reached=true only if you actually got a response from the obsidian MCP tool (even an " +
+      "empty one) — false if the mcp tool errored, timed out, or you didn't call it."
   );
   return lines.join("\n");
 }
@@ -258,6 +267,9 @@ function parseVerdict(text: string): InvestigateVerdict | null {
           : options.length > 0
             ? options
             : undefined,
+      // Fail toward "flag as blind": anything but a literal `true` counts as
+      // not-reached, so a malformed/missing field never masquerades as success.
+      vault_reached: parsed.vault_reached === true,
     };
   } catch {
     return null;

@@ -684,10 +684,52 @@ function logInvestigation(
   try {
     fs.appendFileSync(
       INVESTIGATE_LOG,
-      `${new Date().toISOString()} project=${project ?? "?"} status=${status} confident=${verdict.confident} items=${verdict.items.length} skills=${verdict.skills.length} ms=${elapsedMs} query=${JSON.stringify(query.slice(0, 100))}\n`
+      `${new Date().toISOString()} project=${project ?? "?"} status=${status} confident=${verdict.confident} items=${verdict.items.length} skills=${verdict.skills.length} vault_reached=${verdict.vault_reached} ms=${elapsedMs} query=${JSON.stringify(query.slice(0, 100))}\n`
     );
   } catch {
     /* logging must never break the tool */
+  }
+}
+
+/**
+ * Scan the tail of investigate.log for two active-alerting signals (Task 5):
+ * consecutive failed investigations (child broke and fell back to legacy
+ * recall), and consecutive successful-but-vault-blind investigations (child
+ * ran fine but never reached Obsidian). A passive log file already produced
+ * a multi-week silent outage once in this codebase's history
+ * (recall-gate.log's gate=FAILED streak going unnoticed) — this turns the
+ * log into an active before_agent_start notice instead of trusting a human
+ * to grep it. Best-effort: any read error yields "nothing to report" rather
+ * than blocking session start.
+ */
+function scanRecentInvestigateLog(maxLines = 20): { consecutiveFailures: number; consecutiveVaultBlind: number } {
+  try {
+    const raw = fs.readFileSync(INVESTIGATE_LOG, "utf-8").trim();
+    if (!raw) return { consecutiveFailures: 0, consecutiveVaultBlind: 0 };
+    const lines = raw.split("\n").slice(-maxLines).reverse();
+
+    let consecutiveFailures = 0;
+    for (const line of lines) {
+      if (line.includes("status=child-failed")) {
+        consecutiveFailures++;
+        continue;
+      }
+      break; // any non-failure line ends the streak
+    }
+
+    let consecutiveVaultBlind = 0;
+    for (const line of lines) {
+      if (!line.includes("status=ok")) continue; // failures don't count toward vault-blindness
+      if (line.includes("vault_reached=false")) {
+        consecutiveVaultBlind++;
+        continue;
+      }
+      break; // a successful vault hit (vault_reached=true) ends the streak
+    }
+
+    return { consecutiveFailures, consecutiveVaultBlind };
+  } catch {
+    return { consecutiveFailures: 0, consecutiveVaultBlind: 0 };
   }
 }
 
@@ -1067,6 +1109,24 @@ export default function memoryExtension(pi: ExtensionAPI) {
       // know WHERE to look without having to call memory_taxonomy first.
       if (runtime.config.taxonomyEnabled && runtime.taxonomyText) {
         extra += "\n\n" + runtime.taxonomyText;
+      }
+
+      // Active degraded-session notice (Task 5) — unlike a passive log file,
+      // this guarantees at least one mention to the user rather than relying
+      // on someone to grep investigate.log. "Fail open, never block"
+      // preserved: this only ever adds text, never blocks the turn.
+      const { consecutiveFailures, consecutiveVaultBlind } = scanRecentInvestigateLog();
+      if (consecutiveFailures >= 3) {
+        extra +=
+          `\n\n## memory_investigate degraded\n` +
+          `The last ${consecutiveFailures} investigations failed and fell back to plain similarity search. ` +
+          `Mention this to the user once, briefly — memory context may be lower quality than usual this session.\n`;
+      } else if (consecutiveVaultBlind >= 3) {
+        extra +=
+          `\n\n## Obsidian vault unreachable\n` +
+          `The last ${consecutiveVaultBlind} investigations could not reach the Obsidian vault (memory palace ` +
+          `search still worked). Mention this to the user once — vault content (including project standing ` +
+          `rules) is not being searched this session.\n`;
       }
     }
 
