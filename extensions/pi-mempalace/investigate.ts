@@ -299,8 +299,6 @@ export function parseVerdict(text: string): InvestigateVerdict | null {
 // reach to defend against and ensureObsidianOnlyMcpConfig() above is now only
 // needed by the "child" mechanism fallback.
 
-const VAULT_HOME = process.env.HARNESS_VAULT || join(homedir(), "Desktop", "shashank");
-
 /** Measured ~15-35s per real query (grep/read on plain files + in-process
  * memory tools, no MCP cold start, no fresh OS process) vs 90-220s for the
  * child mechanism — see the design doc's measurement log. If this still
@@ -450,8 +448,15 @@ export async function runInvestigationViaSubagent(
       prompt,
       options: {
         description: "Memory investigation",
-        run_in_background: false,
-        cwd: VAULT_HOME,
+        // NOT cwd: VAULT_HOME. Tried that; it broke the subagent's project
+        // identity — detectProject(ctx.cwd) resolved it to "shashank" (the
+        // vault's own directory name) instead of the caller's actual project,
+        // which is the default filter for memory_search/memory_recall and the
+        // anchor for the cross-project penalty inside the investigator's own
+        // recall. The agent's prompt already names the absolute vault path
+        // (agents/memory-investigator.md); no-cwd is the configuration proven
+        // to work (both manual tests, and the fix for this exact bug).
+        isBackground: false,
       },
     });
   });

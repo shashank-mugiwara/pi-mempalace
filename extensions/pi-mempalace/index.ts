@@ -1168,7 +1168,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
       "You have persistent memory across sessions. Previous conversations and decisions are stored and searchable.\n" +
       (preferInvestigate
         ? "`memory_investigate(query)` gathers judged memory+vault context via a real tool-using search, " +
-          "but it is slow (roughly 1-4 minutes, a real spawned agent turn) — use `memory_search` first " +
+          "slower than memory_search (roughly 15-40s, a real subagent turn) — use `memory_search` first " +
           "(fast, seconds) and only reach for memory_investigate when memory_search comes back empty or " +
           "clearly insufficient and the task genuinely depends on prior-session or vault context. Do not " +
           "call it reflexively on every message.\n"
@@ -1224,11 +1224,20 @@ export default function memoryExtension(pi: ExtensionAPI) {
     // Auto-recall: retrieval must not depend on the model deciding to search.
     // Skipped entirely for investigator children (their whole purpose IS a
     // manual investigation; stacking the legacy per-turn gate on top would
-    // double a gate call for no benefit on a single-shot -p process) AND
-    // skipped whenever investigateEnabled is on (Task 6: memory_investigate
-    // replaces this path; investigateEnabled:false in config.json is the
-    // one-line rollback to the old always-on behavior).
-    if (runtime.config.autoRecall && !isInvestigatorChild && !runtime.config.investigateEnabled) {
+    // double a gate call for no benefit on a single-shot -p process), for the
+    // memory-investigator subagent's own session (investigationInFlight is true
+    // while it runs — same reasoning: it's about to search memory itself, an
+    // injected recall message on its own prompt is wasted latency and noise,
+    // confirmed live: 1.1s spent reranking against the investigator's own
+    // "Query: ..." prompt text), AND skipped whenever investigateEnabled is on
+    // (Task 6: memory_investigate replaces this path; investigateEnabled:false
+    // in config.json is the one-line rollback to the old always-on behavior).
+    if (
+      runtime.config.autoRecall &&
+      !isInvestigatorChild &&
+      !investigationInFlight &&
+      !runtime.config.investigateEnabled
+    ) {
       const query = (event.prompt || "").trim();
       if (query.length >= runtime.config.autoRecallMinPromptChars) {
         try {
@@ -1350,11 +1359,11 @@ export default function memoryExtension(pi: ExtensionAPI) {
       label: "Memory Investigate",
       description:
         "Investigate the memory palace AND Obsidian vault for context relevant to a query, using a " +
-        "real tool-using search (not just similarity ranking). Much slower than memory_search " +
-        "(roughly 1-4 minutes, real cost) — use it only when memory_search comes back empty or clearly " +
+        "real tool-using search (not just similarity ranking). Slower than memory_search " +
+        "(roughly 15-40s, real cost) — use it only when memory_search comes back empty or clearly " +
         "insufficient and the task genuinely depends on prior-session or vault context. Not for routine " +
         "recall on every message.",
-      promptSnippet: "memory_investigate(query) — slow (1-4min) agentic memory+vault investigation, use only when memory_search misses",
+      promptSnippet: "memory_investigate(query) — agentic memory+vault investigation (~15-40s), use when memory_search misses",
       promptGuidelines: [
         "Try memory_search first — it's fast (seconds). Only call this when memory_search returns nothing relevant and the task genuinely needs curated or vault-level context",
         "At most once per session per topic — a repeat/rephrased query on something already investigated this session is served from cache automatically, but don't call it reflexively on every message regardless",
