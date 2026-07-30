@@ -795,6 +795,59 @@ git commit -m "feat(investigate): config-gate legacy auto-recall behind investig
 
 **Resolved via design review (2026-07-30):** the two Critical issues raised — unscoped `mcp` access to internal/paid servers (fixed: Task 2 Step 2a generates and passes a filtered `--mcp-config`), and passive-log-only observability repeating a documented prior silent-outage pattern (fixed: new Task 5, landing before the old Task 5/now Task 6 that removes the existing safety net) — are both now addressed with dedicated tasks rather than deferred. The Important-severity gaps (`createRuntime()` field wiring, a type-union mismatch on `skillsCatalog`, no session-scoped rate ceiling, an imprecise precedent citation for async-spawn, a `confident:false`-with-no-options edge case, dropped stderr diagnostics) are fixed inline in Tasks 2–4 above, each marked with a "caught in design review" note at the exact line it touches.
 
+## Addendum (2026-07-30, same day): decisions #2 and #3 reversed — subagent mechanism
+
+Decision #8 said "latency accepted as a known tradeoff... revisit only if it
+proves annoying in practice." It did, within hours of shipping: `investigateEnabled`
+defaulted `true` in code but was missing from the live `config.json`, so every
+message ran the ~1-4min child-spawn path instead of the ~3-8s legacy autoRecall
+it was meant to supersede on-demand only.
+
+Fixing the config bug (`investigateEnabled:false`) was the actual perf fix, but
+it also prompted revisiting decision #2 (spawn mechanism) and #3 (vault via
+MCP), because most of the measured 90-220s wasn't the search itself:
+
+- The child is a **fresh pi process**, re-resolving model/auth from scratch on
+  every call. Two runs in production hung the full 180s timeout on an expired
+  Bedrock SSO token, even though the child is pinned to
+  `openai-codex/gpt-5.4-mini` and never asked for Bedrock — model-registry init
+  reached for it anyway. An in-process mechanism has no re-init; this class of
+  failure disappears structurally, not by fixing the Bedrock check.
+- **Obsidian MCP roughly triples latency** (documented in the spike results
+  above) via `npx` cold-starting `@bitbonsai/mcpvault` fresh every call. The
+  vault is a plain git repo of LLMWiki-organized markdown on disk
+  (`~/Desktop/shashank` — frontmatter: `title`, `description`, `type`,
+  `status`, `llmwiki_layer`, `memory_project`, `memory_topics`, `updated`;
+  index notes at `Projects/Projects.md` and `Projects/Memory-Wiki/Memory Wiki.md`
+  linking to per-project hub notes via `[[wikilinks]]`). It doesn't need an
+  API — a normal coding agent searches it with `grep`/`find`/`read`, the same
+  way it searches any unfamiliar codebase.
+
+**New mechanism: `agents/memory-investigator.md`, an in-process pi-subagent**,
+spawned via pi-subagents' cross-extension RPC bus (`subagents:rpc:spawn`,
+awaiting `subagents:completed`/`subagents:failed`) instead of
+`child_process.spawn("pi", ["-p", ...])`. Tools: `read, grep, find, ls` plus
+`ext:pi-mempalace/{memory_search,memory_recall,knowledge_query,memory_taxonomy}`
+— no `mcp` extension loads at all. That dissolves decision #2's original
+blocker for pi-subagents (an in-process subagent couldn't scope the shared
+`mcp` gateway tool to Obsidian-only, so it would've leaked reach into paid/
+internal servers like `exa`/`prism`) — the blocker only existed because the
+investigator needed `mcp` for vault access, and it no longer does.
+
+Measured ~15-35s end to end on real queries (two manual tests: 34.0s and
+17.5s), vs 90-220s+ for the child mechanism — see `CHANGELOG-FORK.md` 0.8.5.
+Config-gated (`investigateMechanism: "subagent" | "child"`, default
+`"subagent"`) rather than replacing the child mechanism outright — it stays
+as a one-line rollback per this fork's established convention.
+
+Still true from the original design: decisions #1 (recursion guard, now via a
+module-scoped `investigationInFlight` flag instead of an env var, since the
+subagent shares the parent process), #4 (on-demand tool, agent's own
+judgment — though the guidance text was reworded to de-emphasize automatic
+calling), #5 (no queue file, `ask_user_question` on low confidence), #6
+(judgment-based output count), #7 (one mechanism per call, seeded with prior
+findings — now also session-cached by normalized query).
+
 ## Explicitly out of scope for this change
 
 - `memory_save`, `knowledge_add`, `knowledge_invalidate` — unchanged.

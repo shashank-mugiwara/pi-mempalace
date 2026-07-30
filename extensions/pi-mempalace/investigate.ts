@@ -23,6 +23,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -224,7 +225,7 @@ export async function runInvestigation(
  * no usable options is normalized to a generic clarifying question rather
  * than silently discarding the model's expressed uncertainty.
  */
-function parseVerdict(text: string): InvestigateVerdict | null {
+export function parseVerdict(text: string): InvestigateVerdict | null {
   const end = text.lastIndexOf("}");
   if (end === -1) return null;
   // Scan backward from the last '}' tracking brace depth to find the start
@@ -279,4 +280,179 @@ function parseVerdict(text: string): InvestigateVerdict | null {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Subagent mechanism (pi-subagents RPC) — default, replaces the child spawn
+// above for the common case. See docs/design/memory-investigate.md —
+// "Subagent mechanism" section — for why: the child spawn's real cost wasn't
+// the OS process, it was (a) a fresh pi process re-resolving model/auth from
+// scratch (observed: two runs hung 180s on an expired Bedrock SSO token even
+// though Bedrock was never requested — model-registry init reaching for it
+// anyway) and (b) the Obsidian MCP server cold-starting via `npx` on every
+// call (measured to roughly triple latency). Both disappear when the
+// investigation runs as an in-process pi-subagent that greps/reads the vault
+// directly instead of going through MCP — the vault is LLMWiki-organized
+// plain markdown on disk (see agents/memory-investigator.md), not something
+// that needs an API. Bonus: dissolves the MCP-scoping blocker entirely —
+// no `mcp` extension loads for this agent type, so there's no `exa`/`prism`
+// reach to defend against and ensureObsidianOnlyMcpConfig() above is now only
+// needed by the "child" mechanism fallback.
+
+const VAULT_HOME = process.env.HARNESS_VAULT || join(homedir(), "Desktop", "shashank");
+
+/** Measured ~15-35s per real query (grep/read on plain files + in-process
+ * memory tools, no MCP cold start, no fresh OS process) vs 90-220s for the
+ * child mechanism — see the design doc's measurement log. If this still
+ * needs 60s+ in practice the bottleneck moved to model reasoning, not
+ * transport, and that's the signal to revisit synchronous-vs-background,
+ * not to just raise this number again. */
+const SUBAGENT_TIMEOUT_MS = 75_000;
+
+/** Minimal shape of pi's EventBus (pi.events) — avoids importing pi-coding-agent
+ * types into this module, matching this file's existing "zero pi imports beyond
+ * node builtins" discipline (only the caller, index.ts, touches ExtensionAPI). */
+export interface SubagentEventBus {
+  emit(channel: string, data: unknown): void;
+  on(channel: string, handler: (data: unknown) => void): () => void;
+}
+
+let subagentsReady = false;
+let subagentsReadyWired = false;
+
+/** Wire the one-time subagents:ready listener. Safe to call every session_start —
+ * only the first call binds the listener (module-scoped, survives across sessions
+ * in the same process, which is fine: pi-subagents being loaded is a install-time
+ * fact, not a per-session one). If pi-subagents is never loaded, subagentsReady
+ * stays false forever and runInvestigationViaSubagent fails open immediately
+ * instead of emitting into the void and timing out. */
+export function wireSubagentsReadyTracking(events: SubagentEventBus): void {
+  if (subagentsReadyWired) return;
+  subagentsReadyWired = true;
+  events.on("subagents:ready", () => {
+    subagentsReady = true;
+  });
+}
+
+function buildSubagentPrompt(input: InvestigateInput): string {
+  // The custom agent's own system prompt (agents/memory-investigator.md)
+  // already covers vault strategy, judgment rules, and output format — this
+  // is just the per-call variable part (buildChildPrompt's equivalent for
+  // the child mechanism carries the full instructions since -p replaces the
+  // whole prompt; prompt_mode: replace here means the frontmatter body IS the
+  // system prompt, so this string is the user turn, not a system prompt).
+  const lines = [`Query: ${input.query}`, `Current project: ${input.project ?? "(unknown)"}`];
+  if (input.skills?.length) {
+    lines.push(
+      "",
+      "Skills you may name (never re-explain) up to 2 of, if genuinely applicable:",
+      ...input.skills.map((s) => `- ${s.name}: ${s.description}`)
+    );
+  }
+  if (input.priorFindings?.length) {
+    lines.push(
+      "",
+      "Prior findings from earlier investigations this session (confirm still relevant or supersede, don't blindly repeat):",
+      ...input.priorFindings.map((f) => `- ${f}`)
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Spawn `memory-investigator` as an in-process pi-subagent via the
+ * cross-extension RPC bus and await its verdict. Never throws — every
+ * failure path (pi-subagents not loaded, spawn rejected, timeout, failed
+ * agent, unparseable result) resolves to `null` so the caller
+ * (index.ts's memory_investigate tool) falls open to fallbackToLegacyRecall,
+ * exactly like the child mechanism.
+ */
+export async function runInvestigationViaSubagent(
+  input: InvestigateInput,
+  events: SubagentEventBus,
+  opts: { timeoutMs: number } = { timeoutMs: SUBAGENT_TIMEOUT_MS }
+): Promise<InvestigateVerdict | null> {
+  if (!subagentsReady) {
+    lastFailureDiagnostic = { exitCode: null, stderr: "pi-subagents not ready/loaded in this session", stdoutTail: "" };
+    return null;
+  }
+
+  const prompt = buildSubagentPrompt(input);
+
+  return new Promise((resolve) => {
+    const requestId = randomUUID();
+    let agentId: string | null = null;
+    let settled = false;
+    const unsubs: (() => void)[] = [];
+
+    const settle = (result: InvestigateVerdict | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      for (const unsub of unsubs) unsub();
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => {
+      if (agentId) events.emit("subagents:rpc:stop", { requestId: randomUUID(), agentId });
+      lastFailureDiagnostic = { exitCode: null, stderr: `subagent timeout after ${opts.timeoutMs}ms`, stdoutTail: "" };
+      settle(null);
+    }, opts.timeoutMs);
+
+    // Registered before the spawn emit, per pi-subagents' documented RPC
+    // pattern — the reply and any lifecycle event are dispatched synchronously
+    // through the same in-process event bus, so a listener added after emit()
+    // returns would already have missed a same-tick reply.
+    unsubs.push(
+      events.on(`subagents:rpc:spawn:reply:${requestId}`, (reply: unknown) => {
+        const r = reply as { success: boolean; data?: { id: string }; error?: string };
+        if (!r?.success || !r.data?.id) {
+          lastFailureDiagnostic = { exitCode: null, stderr: `spawn failed: ${r?.error ?? "unknown"}`, stdoutTail: "" };
+          settle(null);
+          return;
+        }
+        agentId = r.data.id;
+      })
+    );
+
+    unsubs.push(
+      events.on("subagents:completed", (e: unknown) => {
+        const ev = e as { id?: string; result?: string };
+        if (!agentId || ev?.id !== agentId) return; // another agent's completion, not ours
+        const verdict = parseVerdict(String(ev.result ?? ""));
+        if (verdict === null) {
+          lastFailureDiagnostic = {
+            exitCode: null,
+            stderr: "unparseable subagent result",
+            stdoutTail: String(ev.result ?? "").slice(-500),
+          };
+        }
+        settle(verdict);
+      })
+    );
+
+    unsubs.push(
+      events.on("subagents:failed", (e: unknown) => {
+        const ev = e as { id?: string; error?: string; status?: string };
+        if (!agentId || ev?.id !== agentId) return;
+        lastFailureDiagnostic = {
+          exitCode: null,
+          stderr: `subagent failed: ${ev?.error ?? ev?.status ?? "unknown"}`,
+          stdoutTail: "",
+        };
+        settle(null);
+      })
+    );
+
+    events.emit("subagents:rpc:spawn", {
+      requestId,
+      type: "memory-investigator",
+      prompt,
+      options: {
+        description: "Memory investigation",
+        run_in_background: false,
+        cwd: VAULT_HOME,
+      },
+    });
+  });
 }

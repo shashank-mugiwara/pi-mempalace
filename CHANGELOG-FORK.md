@@ -1,5 +1,56 @@
 # Fork changelog
 
+## 0.8.5 — 2026-07-30 — memory_investigate: subagent mechanism, and the config bug that made every message slow
+
+**Every per-message context fetch was taking 76-222s.** `investigateEnabled`
+(Task 6, 0.8.4) defaults to `true` in code but was absent from the live
+`~/.pi/agent/memory/config.json`, so the fast legacy autoRecall path
+(`recall.ts`, ~3-8s per the gate log) was dead and the on-demand
+`memory_investigate` tool's ~1-4min child-spawn investigation ran on
+essentially every turn instead. Separately, `autoRecallGateProvider` had
+drifted to `openai-codex/gpt-5.4-mini`, which aborted 3× under the 5s gate
+timeout with `autoRecallGateFailMode: "closed"` discarding every gray-zone
+candidate on each abort. Both are config fixes (not in this repo — in
+`~/.pi/agent/memory/config.json`): `investigateEnabled:false` restores the
+fast path as the automatic per-message injection; the gate provider moved
+back to the tuned `anthropic/claude-haiku-4-5` default with
+`autoRecallGateFailMode:"open"`.
+
+**`memory_investigate` gained a second mechanism, `"subagent"`, now default.**
+The original `"child"` mechanism (`investigate.ts`'s `spawn("pi", ["-p", ...])`)
+paid two costs that had nothing to do with the actual search: a fresh pi
+process re-resolving model/auth from scratch (two runs hung the full 180s on
+an expired Bedrock SSO token even though Bedrock was never requested — model-
+registry init reached for it anyway), and the Obsidian MCP server
+cold-starting via `npx` on every single call (measured to roughly triple
+latency). The vault is a plain git repo of LLMWiki-organized markdown on disk,
+not something that needs an API — so the new mechanism spawns
+`agents/memory-investigator.md` as an in-process pi-subagent (via pi-subagents'
+cross-extension RPC bus: `subagents:rpc:spawn` + `subagents:completed`/
+`subagents:failed`) with `read`/`grep`/`find`/`ls` plus the memory-palace
+tools, no `mcp` extension loaded at all. That also dissolves the MCP-scoping
+blocker that ruled out pi-subagents originally (no `mcp` tool loaded means no
+`exa`/`prism` reach to defend against) and removes the Obsidian-must-be-running
+dependency entirely. Measured ~15-35s per real query end to end, vs 90-220s+
+for the child mechanism. `investigateMechanism: "subagent" | "child"` in
+config — `"child"` kept intact as a one-line rollback, not deleted.
+
+- `investigationCache`: session-scoped `Map<normalizedQuery, verdict>` on
+  `MemoryRuntime`. Two near-identical queries 7 minutes apart in the same
+  session previously cost two full investigations for what can't be a
+  different answer within one session — now the second is served from cache.
+- `investigationInFlight`: module-scoped single-flight guard, shared across
+  every session in the process (including the investigator subagent's own
+  session). Belt-and-braces anti-recursion for the subagent mechanism, and
+  doubles as the signal to suppress wake-up/taxonomy noise in the
+  investigator's own `before_agent_start` — it starts up while this is true.
+- Reworded `memory_investigate`'s description/guidelines and the
+  `before_agent_start` `preferInvestigate` text: `memory_search` is now framed
+  as the default, `memory_investigate` as the slow, occasional exception —
+  the prior wording ("call it on the first substantive message... and
+  whenever you need memory context") was the direct driver of near-every-turn
+  calls.
+
 ## 0.8.4 — 2026-07-25 — the gate was dead, and learning from mistakes
 
 **The recall gate had never once succeeded.** `recall-gate.log` since

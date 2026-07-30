@@ -39,7 +39,13 @@ import { localToday, MemoryStore } from "./memory_store.js";
 import { selectRecall, type GateJudgeInput, type RecallGateOptions, type RecallResult } from "./recall.ts";
 import { warmReranker } from "./reranker.ts";
 import { buildGatePrompt, parseGateResponse, type GateSkillInput, type GateVerdict } from "./gate.ts";
-import { runInvestigation, lastFailureDiagnostic, type InvestigateVerdict } from "./investigate.ts";
+import {
+  runInvestigation,
+  runInvestigationViaSubagent,
+  wireSubagentsReadyTracking,
+  lastFailureDiagnostic,
+  type InvestigateVerdict,
+} from "./investigate.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -146,6 +152,12 @@ interface MemoryConfig {
    * the on-demand memory_investigate tool (Task 6). Set false as a one-line rollback
    * to the old automatic behavior. */
   investigateEnabled: boolean;
+  /** Which mechanism memory_investigate uses. "subagent" (default): in-process
+   * pi-subagent (agents/memory-investigator.md) that greps/reads the vault directly —
+   * fast (~15-35s measured), no MCP, no fresh OS process. "child": the original
+   * restricted `pi -p` spawn with Obsidian MCP access (~90-220s measured) — kept as a
+   * one-line rollback, not deleted, in case the subagent mechanism regresses. */
+  investigateMechanism: "subagent" | "child";
 }
 
 interface MemoryRuntime {
@@ -358,6 +370,7 @@ function defaultConfig(): MemoryConfig {
     autoRecallGateMaxCandidates: 10,
     autoRecallGateSuggestSkills: true,
     investigateEnabled: true,
+    investigateMechanism: "subagent",
   };
 }
 
@@ -959,6 +972,22 @@ async function showStatsOverlay(
 
 // ---------------------------------------------------------------------------
 // Extension
+// Single-flight guard for memory_investigate, module-scoped (shared across every
+// session in this process — including the memory-investigator subagent's own
+// session, which loads this same extension factory independently). Two jobs:
+// (1) belt-and-braces anti-recursion for the "subagent" mechanism — the `tools:`
+// allowlist in agents/memory-investigator.md is the primary defense (the investigator
+// isn't even offered the memory_investigate tool), this is what stops a same-process
+// fork bomb if that frontmatter is ever misconfigured; (2) doubles as the signal to
+// suppress wake-up/taxonomy noise in the investigator subagent's own before_agent_start
+// — it starts up while this is true, so "!investigationInFlight" reads as "not a
+// subagent spawned by an in-flight investigation" without needing real session
+// identity. Known ceiling: a genuinely concurrent second interactive session in the
+// same process would also have its wake-up/taxonomy suppressed for the ~15-35s an
+// investigation is in flight — acceptable on a single-user setup, revisit with a real
+// per-session subagent-identity check if that ever matters.
+let investigationInFlight = false;
+
 // ---------------------------------------------------------------------------
 
 export default function memoryExtension(pi: ExtensionAPI) {
@@ -969,7 +998,11 @@ export default function memoryExtension(pi: ExtensionAPI) {
   // (irrelevant single-shot noise for an investigator). memory_search/memory_recall/
   // knowledge_query/memory_taxonomy stay registered unconditionally — the child needs them.
   // Precedent: hooks/claude-first-prompt-explorer.mjs's MEMPALACE_EXPLORER=1 guard.
+  // (This guard is specific to the "child" mechanism, which runs in a fresh OS process
+  // where env vars are a clean per-process signal; the "subagent" mechanism's equivalent
+  // guard is investigationInFlight above, since it shares this process.)
   const isInvestigatorChild = process.env.MEMPALACE_INVESTIGATOR === "1";
+  wireSubagentsReadyTracking(pi.events);
   const runtimeStore = createRuntimeStore();
   const getSessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId();
   const getRuntime = (ctx: ExtensionContext): MemoryRuntime =>
@@ -1151,7 +1184,9 @@ export default function memoryExtension(pi: ExtensionAPI) {
     // none of the wake-up digest / taxonomy index — irrelevant noise for a
     // single-shot investigation, and injecting them here risked the child
     // seeing prior-session content unrelated to the query it was spawned for.
-    if (!isInvestigatorChild) {
+    // investigationInFlight covers the same case for the "subagent" mechanism —
+    // the memory-investigator subagent's own session starts up while it's true.
+    if (!isInvestigatorChild && !investigationInFlight) {
       if (runtime.config.wakeUpEnabled && runtime.wakeUpText) {
         extra += "\n" + runtime.wakeUpText;
       }
@@ -1343,21 +1378,41 @@ export default function memoryExtension(pi: ExtensionAPI) {
           return formatVerdictResult(cached, params.query);
         }
 
+        // Single-flight: belt-and-braces anti-recursion (see investigationInFlight's
+        // module-level comment). A concurrent call here is either a genuine same-process
+        // race (rare) or the investigator subagent itself somehow re-invoking this tool
+        // (should be impossible — it isn't offered memory_investigate — but this is the
+        // backstop if it ever is). Either way, don't stack a second spawn; fail open.
+        if (investigationInFlight) {
+          logInvestigationRaw(runtime.currentProject, params.query, "reentrant-skip", 0);
+          return await fallbackToLegacyRecall(runtime, params.query, 0);
+        }
+
         checkRateSoft(runtime);
         const t0 = Date.now();
-        const verdict = await runInvestigation({
-          query: params.query,
-          project: runtime.currentProject,
-          // runtime.skillsCatalog is `GateSkillInput[] | null`; InvestigateInput.skills
-          // has no null in its union — `?? undefined` closes that type gap.
-          skills: runtime.config.autoRecallGateSuggestSkills ? (runtime.skillsCatalog ?? undefined) : undefined,
-          priorFindings: runtime.investigationFindings,
-        });
+        investigationInFlight = true;
+        let verdict: InvestigateVerdict | null;
+        try {
+          const investigateInput = {
+            query: params.query,
+            project: runtime.currentProject,
+            // runtime.skillsCatalog is `GateSkillInput[] | null`; InvestigateInput.skills
+            // has no null in its union — `?? undefined` closes that type gap.
+            skills: runtime.config.autoRecallGateSuggestSkills ? (runtime.skillsCatalog ?? undefined) : undefined,
+            priorFindings: runtime.investigationFindings,
+          };
+          verdict =
+            runtime.config.investigateMechanism === "child"
+              ? await runInvestigation(investigateInput)
+              : await runInvestigationViaSubagent(investigateInput, pi.events);
+        } finally {
+          investigationInFlight = false;
+        }
         const elapsedMs = Date.now() - t0;
 
         if (verdict === null) {
           // Fail open — legacy selectRecall path, never return nothing just
-          // because the child process broke. Not cached: a broken child this
+          // because the investigation mechanism broke. Not cached: a broken run this
           // time shouldn't poison a retry a minute later.
           return await fallbackToLegacyRecall(runtime, params.query, elapsedMs);
         }
