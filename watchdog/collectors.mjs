@@ -29,6 +29,7 @@ import { createRequire } from "node:module";
 
 const HOME = homedir();
 const MAX_TEXT = 80_000; // per-candidate cap fed to the summarizer
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -418,12 +419,117 @@ function isTempCwd(cwd) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Claude Code local memory — ~/.claude/projects/<sanitized-cwd>/memory/*.md
+//
+// Claude Code keeps its own per-project file memory, written by the model as
+// it works. It is a third store nothing synced: by 2026-09-02 prism had 42
+// such files and weaver 21 that never reached the palace. Each project's
+// changed notes become one candidate; terra distills them like a transcript
+// but with a lower floor, since the notes are already dense.
+//
+// Watermark: per-file mtime (files are rewritten in place, so byte offsets
+// mean nothing here). First run seeds every note older than the backfill
+// horizon as already-seen so a fresh install does not bill months of notes.
+// ---------------------------------------------------------------------------
+
+const CLAUDE_MEMORY_BACKFILL_MS = 30 * DAY_MS;
+const CLAUDE_MEMORY_MIN_CHARS = 1500;
+
+function readWhole(path) {
+  const size = statSync(path).size;
+  if (size === 0) return "";
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.alloc(size);
+    readSync(fd, buf, 0, size, 0);
+    return buf.toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** cwd for a Claude project dir, read from any session file beside memory/. */
+function claudeDirCwd(projectDir) {
+  for (const f of globSync(join(projectDir, "*.jsonl")).slice(0, 5)) {
+    const cwd = claudeCwd(f);
+    if (cwd) return cwd;
+  }
+  return null;
+}
+
+export function collectClaudeMemory(state, activeWithinMs) {
+  state.claudeMemory ??= {};
+  const initial = !state.claudeMemorySeededAt;
+  const horizon = Date.now() - CLAUDE_MEMORY_BACKFILL_MS;
+  const byDir = new Map();
+
+  for (const f of globSync(join(HOME, ".claude", "projects", "*", "memory", "*.md"))) {
+    if (basename(f) === "MEMORY.md") continue; // index, not content
+    let st;
+    try {
+      st = statSync(f);
+    } catch {
+      continue;
+    }
+    const seen = state.claudeMemory[f]?.mtimeMs ?? null;
+    if (seen === null && initial && st.mtimeMs < horizon) {
+      state.claudeMemory[f] = { mtimeMs: st.mtimeMs, at: new Date().toISOString() };
+      continue;
+    }
+    if (seen !== null && st.mtimeMs <= seen) continue;
+    if (Date.now() - st.mtimeMs > Math.max(activeWithinMs, CLAUDE_MEMORY_BACKFILL_MS)) continue;
+    const dir = join(f, "..", "..");
+    if (!byDir.has(dir)) byDir.set(dir, []);
+    byDir.get(dir).push({ path: f, mtimeMs: st.mtimeMs });
+  }
+  if (initial) state.claudeMemorySeededAt = new Date().toISOString();
+
+  const out = [];
+  for (const [dir, files] of byDir) {
+    const cwd = claudeDirCwd(dir);
+    const parts = [];
+    for (const { path } of files) {
+      let text = "";
+      try {
+        text = readWhole(path).trim();
+      } catch {
+        continue;
+      }
+      if (text) parts.push(`### ${basename(path)}\n${text}`);
+    }
+    const text = parts.join("\n\n").trim();
+    const lastActivityMs = Math.max(...files.map((x) => x.mtimeMs));
+    const mark = (st) => {
+      st.claudeMemory ??= {};
+      for (const { path, mtimeMs } of files) {
+        st.claudeMemory[path] = { mtimeMs, at: new Date().toISOString() };
+      }
+    };
+    out.push({
+      source: "claude-memory",
+      key: join(dir, "memory"),
+      project: projectFromCwd(cwd) === "general" ? basename(dir).split("-").filter(Boolean).at(-1) : projectFromCwd(cwd),
+      cwd,
+      text: truncateMiddle(text),
+      rawTextLength: text.length,
+      newBytes: files.length,
+      lastActivityMs,
+      minChars: CLAUDE_MEMORY_MIN_CHARS,
+      commit: mark,
+      skipCommit: mark,
+    });
+  }
+  return out;
+}
+
 export function collectAll(state, activeWithinMs) {
   return [
     ...collectClaude(state, activeWithinMs),
     ...collectPi(state, activeWithinMs),
     ...collectCodex(state, activeWithinMs),
     ...collectOpencode(state, activeWithinMs),
+    ...collectClaudeMemory(state, activeWithinMs),
   ].filter((c) => {
     if (!isTempCwd(c.cwd)) return true;
     c.skipCommit(state); // park the watermark so it never re-parses

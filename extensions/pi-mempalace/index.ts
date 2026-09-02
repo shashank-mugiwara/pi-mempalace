@@ -1178,23 +1178,18 @@ export default function memoryExtension(pi: ExtensionAPI) {
     // digest (fresh project, wake-up error) must not silently drop the memory
     // tool guidance from the prompt.
     const preferInvestigate = runtime.config.investigateEnabled && !isInvestigatorChild;
+    // Kept to three lines on purpose. Each tool's own promptGuidelines already
+    // say when to use it, and the host's APPEND_SYSTEM carries the protocol;
+    // the earlier per-tool sentence list here was the third copy of the same
+    // guidance (~770 chars per turn) and named tools that may be inactive.
     let extra =
       "\n\n## Agent Memory (ACTIVE)\n" +
-      "You have persistent memory across sessions. Previous conversations and decisions are stored and searchable.\n" +
+      "Persistent cross-session memory is on and auto-capture is off: nothing is remembered unless you save it " +
+      "(`memory_save`, `knowledge_add`). Search before asking the user to repeat prior context (`memory_search`, " +
+      "`memory_recall`), `memory_check_duplicate` before saving, and supersede or `knowledge_invalidate` rather than duplicate.\n" +
       (preferInvestigate
-        ? "`memory_investigate(query)` gathers judged memory+vault context via a real tool-using search, " +
-          "slower than memory_search (roughly 15-40s, a real subagent turn) — use `memory_search` first " +
-          "(fast, seconds) and only reach for memory_investigate when memory_search comes back empty or " +
-          "clearly insufficient and the task genuinely depends on prior-session or vault context. Do not " +
-          "call it reflexively on every message.\n"
-        : "") +
-      "Use `memory_search` to find past context. Use `memory_save` to explicitly remember something important.\n" +
-      "Use `memory_recall` to browse memories for a specific project or topic.\n" +
-      "Use `memory_graph` to discover cross-project connections via shared topics.\n" +
-      "Use `knowledge_add` to record structured facts. Use `knowledge_query` to query them.\n" +
-      "Use `knowledge_invalidate` to mark facts as no longer true. Use `knowledge_timeline` for chronological history.\n" +
-      "Use `memory_diary_write` to record reflections. Use `memory_diary_read` to review past entries.\n" +
-      "Use `memory_delete` to remove specific memories. Use `memory_check_duplicate` before storing.\n";
+        ? "`memory_investigate(query)` is the slow, tool-using fallback (15-40s) for when memory_search misses and the task depends on prior-session or vault context — not for routine recall.\n"
+        : "");
     // Investigator children (see recursion guard, top of this function) get
     // none of the wake-up digest / taxonomy index — irrelevant noise for a
     // single-shot investigation, and injecting them here risked the child

@@ -43,6 +43,14 @@ const MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
 const EMBEDDING_DIM = 384;
 
 // Chunking constants
+/**
+ * Topics that hold exactly one memory per project. `store()` deletes the
+ * previous family before writing, so the invariant no longer depends on the
+ * caller (CLI, watchdog, pi tool, omp checkpoint) remembering to delete first.
+ * Mirrored in harness/lib/health.mjs, which audits the store for violations.
+ */
+const SINGLETON_TOPICS = new Set(["session-resume", "todo-state", "playbook"]);
+
 const CHUNK_SIZE = 800;      // characters per chunk
 const CHUNK_OVERLAP = 100;   // overlap between chunks
 const MIN_CHUNK_SIZE = 50;   // skip tiny fragments
@@ -714,6 +722,16 @@ export class MemoryStore {
     const sessionId = input.session_id || "";
     const importance = input.importance ?? 0.5;
 
+    // One-per-project topics are superseded here, structurally, rather than
+    // by every caller remembering to delete first. The convention-only version
+    // failed: on 2026-08-31 the watchdog's review-approved path wrote two
+    // extra session-resume rows for prism and one for weaver, and the newest
+    // by timestamp was an older hand-off — the next session was told to
+    // resume the wrong work. A supersede that depends on the caller is a wish.
+    if (SINGLETON_TOPICS.has(topic) && project !== "general") {
+      this.supersedeAllTopic(project, topic, `mem_${contentHash(content)}`);
+    }
+
     const chunks = chunkText(content);
 
     // Short content: behave exactly as before (no chunking)
@@ -1377,6 +1395,54 @@ export class MemoryStore {
     } catch {
       return { superseded: false };
     }
+  }
+
+  /**
+   * Delete every memory family for (project, topic) except `keepId`'s family.
+   * Called from `store()` for SINGLETON_TOPICS so the invariant "exactly one
+   * per project" holds regardless of which agent or script wrote the row.
+   * `keepId` is the id the incoming save will get (or already has, when the
+   * content is byte-identical and the save dedupes) — that family survives.
+   * Best-effort: a failure here leaves an extra row, never blocks the save.
+   */
+  supersedeAllTopic(project: string, topic: string, keepId: string): { removed: number } {
+    this.ensureLoaded();
+    let removed = 0;
+    try {
+      const rows = this.db
+        .prepare(`SELECT id FROM memories WHERE project = ? AND topic = ? AND chunk_index = 0`)
+        .all(project, topic) as { id: string }[];
+      const keepFamily = keepId.replace(/_c\d+$/, "");
+      for (const row of rows) {
+        if (row.id.replace(/_c\d+$/, "") === keepFamily) continue;
+        try {
+          this.delete(row.id);
+          removed++;
+        } catch {
+          /* already gone or unreadable — keep going */
+        }
+      }
+    } catch {
+      /* best-effort */
+    }
+    return { removed };
+  }
+
+  /**
+   * Re-weight a memory (whole chunk family). Used by the consolidation pass
+   * after a human approves a demotion — importance is the only field that
+   * ranking reads besides similarity, so this is how a stale-but-true memory
+   * stops competing with live ones without being forgotten.
+   */
+  setImportance(id: string, importance: number): { updated: number } {
+    this.ensureLoaded();
+    const value = Math.max(0, Math.min(1, Number(importance)));
+    const family = id.replace(/_c\d+$/, "");
+    const res = this.db
+      .prepare(`UPDATE memories SET importance = ? WHERE id = ? OR id = ? OR parent_id = ?`)
+      .run(value, id, `${family}_c0`, `${family}_c0`);
+    this.cachedL1 = null;
+    return { updated: Number(res.changes) };
   }
 
   listProjects(): { projects: Record<string, number>; total: number } {

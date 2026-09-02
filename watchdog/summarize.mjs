@@ -116,9 +116,11 @@ export function buildPrompt(candidate, ctx) {
 
   return `You are the session-watchdog memory curator for a shared cross-agent memory palace (pi, Claude Code, opencode, codex all read it — bad memory amplifies bad work, so precision beats coverage).
 
-A coding session produced new dialogue. Distill it into durable memory updates.
+${candidate.source === "claude-memory"
+    ? "Claude Code wrote or updated its LOCAL per-project memory notes (already distilled by the agent, not a transcript). Import the durable facts, decisions and lessons they hold that the shared palace does not already have; skip anything already present or purely Claude-Code-internal."
+    : "A coding session produced new dialogue. Distill it into durable memory updates."}
 
-## New session dialogue (${candidate.source}, project guess: ${candidate.project}, cwd: ${candidate.cwd || "?"})
+## ${candidate.source === "claude-memory" ? "Changed local memory notes" : "New session dialogue"} (${candidate.source}, project guess: ${candidate.project}, cwd: ${candidate.cwd || "?"})
 <transcript-delta>
 ${candidate.text}
 </transcript-delta>
@@ -243,7 +245,9 @@ export function runTerra(prompt, opts = {}) {
   }
   const parsed = extractJson(text);
   if (!parsed) return { ok: false, error: "unparseable model output: " + text.slice(0, 200) };
-  return { ok: true, result: normalize(parsed) };
+  // `raw` callers (consolidate.mjs) bring their own schema; normalize() would
+  // drop every key it does not know.
+  return { ok: true, result: opts.raw ? parsed : normalize(parsed) };
 }
 
 export function extractJson(text) {
