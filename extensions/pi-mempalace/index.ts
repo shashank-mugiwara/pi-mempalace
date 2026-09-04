@@ -35,7 +35,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { localToday, MemoryStore } from "./memory_store.js";
+import { isNonProjectName, localToday, MemoryStore } from "./memory_store.js";
 import { selectRecall, type GateJudgeInput, type RecallGateOptions, type RecallResult } from "./recall.ts";
 import { warmReranker } from "./reranker.ts";
 import { buildGatePrompt, parseGateResponse, type GateSkillInput, type GateVerdict } from "./gate.ts";
@@ -434,7 +434,19 @@ function detectProject(cwd: string): string {
   if (fs.existsSync(gitDir)) {
     return path.basename(cwd);
   }
-  return path.basename(cwd) || "general";
+  // A session started in ~, ~/Documents, /tmp… has no project; saving under the
+  // folder name buried memories under "shashank.j" and "Documents" for months.
+  const name = path.basename(cwd);
+  return isNonProjectName(name) ? "general" : name;
+}
+
+/** Writers refuse the placeholder project so a save is either filed properly or asked about. */
+function projectRefusal(project: string, tool: string): string | null {
+  if (!isNonProjectName(project)) return null;
+  return (
+    `${tool} needs an explicit \`project\` — the current directory resolves to "${project}", which is a working directory, not a project. ` +
+    `Pass the canonical project name (see memory_list_rooms) and retry.`
+  );
 }
 
 /**
@@ -1486,6 +1498,8 @@ export default function memoryExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       const project = params.project || runtime.currentProject;
+      const refusal = projectRefusal(project, "memory_save");
+      if (refusal) return textResult(`\u26a0\ufe0f ${refusal}`, { status: "refused", project });
 
       try {
         const result = await runtime.store.store({
@@ -1747,6 +1761,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
       "Subject and object are entities (people, tools, projects), predicate is the relationship",
       "Set valid_from/valid_to for time-bounded facts (e.g., 'used React until 2025-06')",
       "Common predicates: uses, depends_on, decided, prefers, created_by, replaces, implements",
+      "Type every NEW entity: pass subject_type/object_type (service, tool, project, library, person, file-path, mcp-server, concept…) or add an is_a fact — untyped entities are the graph's main decay",
     ],
     parameters: Type.Object({
       subject: Type.String({ description: "The subject entity (e.g., 'myapp', 'Alice')" }),
@@ -1755,12 +1770,16 @@ export default function memoryExtension(pi: ExtensionAPI) {
       valid_from: Type.Optional(Type.String({ description: "When this fact became true (ISO date)" })),
       valid_to: Type.Optional(Type.String({ description: "When this fact stopped being true (ISO date, null if still true)" })),
       project: Type.Optional(Type.String({ description: "Project context for this fact" })),
+      subject_type: Type.Optional(Type.String({ description: "Type of the subject entity if new (kebab-case: service, tool, project, library, person, file-path, mcp-server, concept, …)" })),
+      object_type: Type.Optional(Type.String({ description: "Type of the object entity if new (same vocabulary)" })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       const project = params.project || runtime.currentProject;
-      
+      const refusal = projectRefusal(project, "knowledge_add");
+      if (refusal) return textResult(`\u26a0\ufe0f ${refusal}`, { status: "refused", project });
+
       try {
         const result = runtime.store.addTriple({
           subject: params.subject,
@@ -1769,6 +1788,8 @@ export default function memoryExtension(pi: ExtensionAPI) {
           valid_from: params.valid_from,
           valid_to: params.valid_to,
           project,
+          subject_type: params.subject_type,
+          object_type: params.object_type,
         });
         
         const timeInfo = params.valid_from ? ` (since ${params.valid_from})` : "";

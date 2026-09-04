@@ -183,6 +183,9 @@ export interface TripleInput {
   confidence?: number;
   source_memory_id?: string;
   project?: string;
+  /** Optional entity types for auto-created endpoints (e.g. "service", "tool"). */
+  subject_type?: string;
+  object_type?: string;
 }
 
 export interface TripleResult {
@@ -316,6 +319,36 @@ function base64ToEmbedding(b64: string): Float32Array {
 // ---------------------------------------------------------------------------
 // Content Hash
 // ---------------------------------------------------------------------------
+
+/** Predicates whose object names the subject's type (`prism is_a project`). */
+export const IS_A_PREDICATES: ReadonlySet<string> = new Set(["is_a", "is_an", "instance_of", "type", "kind"]);
+
+/**
+ * Entity types are a small kebab-case vocabulary (service, tool, project, library,
+ * person, file-path, mcp-server …). Free text is squashed to that shape and
+ * anything that does not survive (empty, or a whole sentence) is rejected so a
+ * sentence-long is_a object never becomes a "type".
+ */
+export function normalizeEntityType(raw: string | undefined | null): string | undefined {
+  if (raw == null) return undefined;
+  const t = String(raw).trim().toLowerCase().replace(/[\s_]+/g, "-").replace(/[^a-z0-9-]/g, "").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  if (!t || t === "unknown" || t.length > 32 || t.split("-").length > 4) return undefined;
+  return t;
+}
+
+/**
+ * Project names that are really just a working directory: the home folder, its
+ * standard children, temp dirs. Memories saved under these are unrecoverable
+ * later ("Documents" is not a project), so writers refuse them.
+ */
+export function isNonProjectName(name: string | undefined | null): boolean {
+  if (!name) return true;
+  const n = String(name).trim();
+  if (!n || n.toLowerCase() === "general") return true;
+  const home = os.homedir();
+  const junk = new Set(["documents", "desktop", "downloads", "tmp", "temp", "home", "users", "root", "src", "github", path.basename(home).toLowerCase()]);
+  return junk.has(n.toLowerCase());
+}
 
 function contentHash(content: string): string {
   return crypto
@@ -1775,15 +1808,30 @@ export class MemoryStore {
   addTriple(input: TripleInput): TripleResult {
     this.ensureLoaded();
 
-    // Auto-create entities if they don't exist
+    // Auto-create entities if they don't exist. A caller-supplied type is
+    // applied (COALESCE in addEntity keeps an existing type when none is given).
     this.addEntity({
       name: input.subject,
       id: `ent_${contentHash(input.subject.toLowerCase())}`,
+      entity_type: normalizeEntityType(input.subject_type),
     });
     this.addEntity({
       name: input.object,
       id: `ent_${contentHash(input.object.toLowerCase())}`,
+      entity_type: normalizeEntityType(input.object_type),
     });
+    // PROTOCOL.md has always said "give every new entity a type via an is_a
+    // fact" — but nothing read those facts, which is how 400+ entities ended up
+    // typed 'unknown'. An is_a fact now types its subject.
+    if (IS_A_PREDICATES.has(input.predicate.toLowerCase())) {
+      const t = normalizeEntityType(input.object);
+      if (t) {
+        this.setEntityType(input.subject, t);
+        // The object of an is_a fact is a type name, not a thing — mark it so it
+        // never shows up in kg-untyped as if it were an entity nobody classified.
+        this.setEntityTypeIfUnknown(input.object, "type");
+      }
+    }
 
     const subjectId = `ent_${contentHash(input.subject.toLowerCase())}`;
     const objectId = `ent_${contentHash(input.object.toLowerCase())}`;
@@ -1806,6 +1854,65 @@ export class MemoryStore {
       );
 
     return { status: "created", id: Number(info.lastInsertRowid) };
+  }
+
+  /** Set (overwrite) the type of an existing entity by name. */
+  setEntityType(name: string, type: string): { status: "updated" | "missing"; id: string } {
+    this.ensureLoaded();
+    const id = `ent_${contentHash(name.toLowerCase())}`;
+    const t = normalizeEntityType(type);
+    if (!t) throw new Error(`invalid entity type: ${JSON.stringify(type)}`);
+    const info = this.db.prepare(`UPDATE entities SET entity_type = ? WHERE id = ?`).run(t, id);
+    return { status: info.changes > 0 ? "updated" : "missing", id };
+  }
+
+  /** Type an entity only if it is still 'unknown' (never clobbers a real type). */
+  setEntityTypeIfUnknown(name: string, type: string): boolean {
+    this.ensureLoaded();
+    const id = `ent_${contentHash(name.toLowerCase())}`;
+    const t = normalizeEntityType(type);
+    if (!t) return false;
+    return this.db.prepare(`UPDATE entities SET entity_type = ? WHERE id = ? AND entity_type = 'unknown'`).run(t, id).changes > 0;
+  }
+
+  /** Entities still typed 'unknown', with how many facts reference them (optionally within a project). */
+  listUntypedEntities(options?: { project?: string; limit?: number }): Array<{ name: string; facts: number }> {
+    this.ensureLoaded();
+    const limit = Math.max(1, Math.min(500, options?.limit ?? 50));
+    const proj = options?.project ? "AND t.project = ?" : "";
+    const args: unknown[] = options?.project ? [options.project, limit] : [limit];
+    return this.db
+      .prepare(
+        `SELECT e.name as name, COUNT(t.id) as facts
+         FROM entities e
+         LEFT JOIN triples t ON (t.subject = e.id OR t.object = e.id) ${proj}
+         WHERE e.entity_type = 'unknown'
+         GROUP BY e.id ORDER BY facts DESC, e.name ASC LIMIT ?`
+      )
+      .all(...args) as Array<{ name: string; facts: number }>;
+  }
+
+  /** One-off migration: type every 'unknown' subject that already has an active is_a fact. */
+  backfillTypesFromIsA(): { updated: number; skipped: number } {
+    this.ensureLoaded();
+    const preds = [...IS_A_PREDICATES].map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT s.id as sid, o.name as type FROM triples t
+         JOIN entities s ON s.id = t.subject JOIN entities o ON o.id = t.object
+         WHERE lower(t.predicate) IN (${preds}) AND t.valid_to IS NULL AND s.entity_type = 'unknown'
+         ORDER BY t.created_at ASC`
+      )
+      .all(...IS_A_PREDICATES) as Array<{ sid: string; type: string }>;
+    let updated = 0, skipped = 0;
+    const upd = this.db.prepare(`UPDATE entities SET entity_type = ? WHERE id = ? AND entity_type = 'unknown'`);
+    for (const r of rows) {
+      const t = normalizeEntityType(r.type);
+      if (!t) { skipped++; continue; }
+      if (upd.run(t, r.sid).changes > 0) updated++; else skipped++;
+      if (this.setEntityTypeIfUnknown(r.type, "type")) updated++;
+    }
+    return { updated, skipped };
   }
 
   /**

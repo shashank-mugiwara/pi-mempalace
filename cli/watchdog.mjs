@@ -224,6 +224,18 @@ async function cmdApplyReview(opts) {
     process.exit(1);
   }
   const review = loadReview();
+  // Fail before touching anything if an id is not in the queue: a typo or a
+  // stale id used to be ignored silently, which reads as "applied" to the caller.
+  const known = new Set(review.map((r) => r.id));
+  const unknown = [...approve, ...reject].filter((id) => !known.has(id));
+  const both = approve.filter((id) => reject.includes(id));
+  if (unknown.length || both.length) {
+    if (unknown.length) console.error(`not in queue: ${unknown.join(", ")}`);
+    if (both.length) console.error(`listed as both approve and reject: ${both.join(", ")}`);
+    console.error(`nothing applied (queue: ${review.length} items; run \`review\` to list ids)`);
+    process.exit(1);
+  }
+  console.log(`applying: ${approve.length} approve, ${reject.length} reject (queue: ${review.length})`);
   const store = new MemoryStore();
   const keep = [];
   const rejected = [];

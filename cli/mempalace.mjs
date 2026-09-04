@@ -24,14 +24,17 @@
  *   forget   <id>                      Delete a memory (family-aware)
  *   status   [--json]
  *   projects [--json]
- *   kg-add   <subject> <predicate> <object> [--project P] [--from DATE] [--to DATE]
+ *   kg-add   <subject> <predicate> <object> --project P [--subject-type T] [--object-type T] [--from DATE] [--to DATE]
  *   kg-query <entity> [--at DATE] [--project P] [--json]
  *   kg-invalidate <subject> <predicate> <object> [--to DATE]
+ *   kg-type  <entity> <type>           Set an entity's type
+ *   kg-untyped [--project P] [-n N]    Entities still typed unknown
+ *   kg-backfill-types                  Type unknown entities from their existing is_a facts
  *
  * Run `node mempalace.mjs --help` for full details.
  */
 
-import { localToday, MemoryStore } from "../extensions/pi-mempalace/memory_store.ts";
+import { isNonProjectName, localToday, MemoryStore } from "../extensions/pi-mempalace/memory_store.ts";
 
 const store = new MemoryStore();
 
@@ -55,11 +58,29 @@ async function cmdSearch(query, opts) {
   );
 }
 
+/**
+ * Writers require a real project. "general", the home folder, Documents, tmp…
+ * are working directories, not projects, and memories filed there were never
+ * found again (the 2026-09-04 audit turned up 46 such rows).
+ */
+function requireProject(opts, cmd) {
+  const p = opts.project;
+  if (isNonProjectName(p)) {
+    fail(
+      `${cmd} needs --project <canonical name>` +
+        (p ? ` ("${p}" is a working directory, not a project)` : "") +
+        ". Run `projects` to see the names in use."
+    );
+  }
+  return p;
+}
+
 async function cmdSave(content, opts) {
   if (!content || !content.trim()) fail("save requires <content>");
+  const project = requireProject(opts, "save");
   const result = await store.store({
     content: content.trim(),
-    project: opts.project || "general",
+    project,
     topic: opts.topic || "general",
     source: opts.source || "cli",
     importance: opts.importance != null ? parseFloat(opts.importance) : 0.5,
@@ -127,15 +148,47 @@ function cmdProjects(opts) {
 function cmdKgAdd(subject, predicate, object, opts) {
   if (!subject || !predicate || !object)
     fail("kg-add requires <subject> <predicate> <object>");
+  const project = requireProject(opts, "kg-add");
   const result = store.addTriple({
     subject,
     predicate,
     object,
     valid_from: opts.from || undefined,
     valid_to: opts.to || undefined,
-    project: opts.project || "general",
+    project,
+    subject_type: opts["subject-type"] || undefined,
+    object_type: opts["object-type"] || undefined,
   });
-  emit(opts, result, () => `fact #${result.id}: ${subject} ${predicate} ${object}`);
+  const untyped = store
+    .listUntypedEntities({ limit: 500 })
+    .filter((e) => [subject.toLowerCase(), object.toLowerCase()].includes(e.name.toLowerCase()))
+    .map((e) => e.name);
+  emit(opts, { ...result, untyped }, () =>
+    `fact #${result.id}: ${subject} ${predicate} ${object}` +
+    (untyped.length ? `\n  untyped: ${untyped.join(", ")} — type with \`kg-type <entity> <type>\` or --subject-type/--object-type` : "")
+  );
+}
+
+function cmdKgType(entity, type, opts) {
+  if (!entity || !type) fail("kg-type requires <entity> <type>");
+  const result = store.setEntityType(entity, type);
+  if (result.status === "missing") fail(`no entity named ${JSON.stringify(entity)} (names match case-insensitively; check kg-query)`);
+  emit(opts, result, () => `typed: ${entity} -> ${type}`);
+}
+
+function cmdKgUntyped(opts) {
+  const rows = store.listUntypedEntities({
+    project: opts.project || undefined,
+    limit: opts.n != null ? parseInt(opts.n, 10) : 50,
+  });
+  emit(opts, rows, () =>
+    rows.length ? rows.map((r) => `${r.facts}\t${r.name}`).join("\n") : "No untyped entities."
+  );
+}
+
+function cmdKgBackfillTypes(opts) {
+  const result = store.backfillTypesFromIsA();
+  emit(opts, result, () => `typed ${result.updated} entities from is_a facts (${result.skipped} skipped: no usable type)`);
 }
 
 function cmdKgInvalidate(subject, predicate, object, opts) {
@@ -214,11 +267,20 @@ COMMANDS
   status                           Store overview (counts, size, KG)  --json
   projects                         List projects with counts  --json
   kg-add   <subj> <pred> <obj>     Add a knowledge-graph fact (dates stored as YYYY-MM-DD)
-      --project P  --from DATE  --to DATE  --json
+      --project P (required)  --subject-type T  --object-type T  --from DATE  --to DATE  --json
+      An is_a fact also types its subject: kg-add weaver is_a service --project weaver
   kg-query <entity>                Query facts about an entity
       --at DATE  --project P  --json
   kg-invalidate <subj> <pred> <obj>  End an active fact (sets valid_to; pair with a
       --to DATE  --json              fresh kg-add when a fact is superseded)
+  kg-type  <entity> <type>         Set an entity's type (kebab-case: service, tool, project,
+                                   library, person, file-path, mcp-server, concept, …)
+  kg-untyped                       Entities still typed unknown, most-referenced first
+      --project P  -n N (max 500)  --json
+  kg-backfill-types                Type every unknown entity that already has an is_a fact
+
+  save and kg-add REFUSE --project general, the home folder, Documents, tmp and
+  similar working-directory names: pass the canonical project (see 'projects').
 
 NOTES
   Same engine code as the pi extension (imported from memory_store.ts), so
@@ -243,6 +305,9 @@ async function main() {
     case "kg-add": return cmdKgAdd(positional[0], positional[1], positional[2], opts);
     case "kg-query": return cmdKgQuery(positional[0], opts);
     case "kg-invalidate": return cmdKgInvalidate(positional[0], positional[1], positional[2], opts);
+    case "kg-type": return cmdKgType(positional[0], positional[1], opts);
+    case "kg-untyped": return cmdKgUntyped(opts);
+    case "kg-backfill-types": return cmdKgBackfillTypes(opts);
     default: fail(`unknown command: ${cmd}. Run --help.`);
   }
 }

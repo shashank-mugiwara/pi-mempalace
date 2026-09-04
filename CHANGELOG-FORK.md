@@ -1,5 +1,46 @@
 # Fork changelog
 
+## 0.8.8 — 2026-09-05 — the knowledge graph finally reads its own `is_a` facts; writers refuse non-projects
+
+Found by the 2026-09-04 memory-harness audit: 405 of 658 entities were typed
+`unknown`. PROTOCOL.md had said since 0.6 "give every new entity a type via an
+`is_a` fact", and agents did — 77 untyped entities carried one — but nothing in
+`memory_store.ts` ever read the predicate. Separately, 46 memories sat under the
+projects `shashank.j` and `Documents`: `detectProject()` returns the cwd basename,
+so a session started in the home folder filed everything under the user name.
+
+- `addTriple()` now types the subject when the predicate is `is_a` / `is_an` /
+  `instance_of` / `type` / `kind`, and accepts `subject_type` / `object_type` for
+  the auto-created endpoints (`COALESCE` in `addEntity` keeps an existing type).
+  `normalizeEntityType()` squashes free text to the kebab-case vocabulary and
+  rejects sentence-long objects so `is_a "Python CLI tool for scoring…"` does not
+  become a type.
+- New store methods `setEntityType`, `listUntypedEntities`, `backfillTypesFromIsA`;
+  new CLI commands `kg-type <entity> <type>`, `kg-untyped [--project P] [-n N]`,
+  `kg-backfill-types`; `kg-add` gained `--subject-type` / `--object-type` and reports
+  which endpoints are still untyped after the write.
+- `knowledge_add` (pi tool) gained `subject_type` / `object_type` and a guideline
+  line; `isNonProjectName()` names the working-directory placeholders (general,
+  the home folder, Documents, Desktop, Downloads, tmp…). `save` / `kg-add` in the CLI
+  and `memory_save` / `knowledge_add` in pi refuse them with a message that names
+  the fix instead of filing the memory where nobody will look.
+- `watchdog.mjs apply-review` fails before applying anything when an id is not in
+  the queue or is listed as both approve and reject, and prints the counts it is
+  about to apply. Unknown ids used to be skipped silently, which reads as success.
+
+Migration for an existing store: `node cli/mempalace.mjs kg-backfill-types` (types
+the entities that already have an is_a fact), then `kg-untyped` to see the rest.
+
+## 0.8.7 — 2026-09-02 — singleton supersede, consolidation, claude-memory collector
+
+Shipped as `ef77916` + `44e5a56` without a version bump (package.json stayed at
+0.8.6); recorded here so the pin history reads correctly. `MemoryStore.store()`
+deletes prior `session-resume` / `todo-state` / `playbook` families for the project
+before writing (`SINGLETON_TOPICS`); `supersedeAllTopic()` and `setImportance()`
+added; watchdog `consolidate` command with a monthly auto-run, `merge` / `demote` /
+`delete` review kinds, a claude-memory collector for `~/.claude/projects/*/memory`,
+`watchdogTimeoutMs` (600 s default) and per-candidate `minChars`.
+
 ## 0.8.6 — 2026-07-30 — auto-recall becomes project-scoped, not semantic-search-scoped
 
 **`autoRecall` (the per-message bi-encoder + cross-encoder + Haiku-gate pipeline,

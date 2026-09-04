@@ -147,11 +147,18 @@ entity or point in time — not prose. Prose rationale goes in `save`; the relat
 goes in the KG (they complement, don't duplicate).
 
 - **Shape**: `kg-add <subject> <predicate> <object> --project P --from YYYY-MM-DD`
+  (`--project` is required and must be a canonical project — `general`, the home
+  folder, `Documents`, `tmp` and the like are refused).
 - **Entities**: one canonical name per real-world thing — reuse exactly what `kg-query`
   already knows (entity match is by lowercased name hash — `Prism` and `prism` match,
   but `prism-docs` and `prism` don't). Project entities use the same name as their
-  `--project` tag. Give every NEW entity a type via an `is_a` fact (e.g.
-  `kg-add weaver is_a service`) — never leave it untyped.
+  `--project` tag. Give every NEW entity a type: `--subject-type T` / `--object-type T`
+  on the `kg-add` (or `subject_type` / `object_type` on `knowledge_add`), or an
+  `is_a` fact (`kg-add weaver is_a service --project weaver`) — since 0.8.8 the store
+  reads `is_a` and types the subject. Types are kebab-case from the vocabulary in use
+  (`service`, `tool`, `project`, `library`, `person`, `file-path`, `mcp-server`,
+  `concept`, `metric`, `agent`, `skill`…). `kg-untyped` lists what is still unknown;
+  `kg-type <entity> <type>` fixes one.
 - **Predicates**: snake_case, from the vocabulary already established in the graph —
   extend it only when nothing fits, and check `kg-query` for what's in use first:
   `uses`, `depends_on`, `calls`, `runtime_dependency`, `implements`, `decided`,
