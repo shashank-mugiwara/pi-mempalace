@@ -15,23 +15,37 @@
  *   - every doubt
  *
  * Doubt ⇒ queue, never guess.
+ *
+ * Queue hygiene (2026-09-23, audit D7 — the queue had reached 158 items):
+ *   - a supersede whose target memory no longer exists is dropped, not
+ *     queued (findMemory() returning null used to route it to the queue);
+ *   - one pending supersede per target: a newer proposal replaces the older;
+ *   - every write and queued item goes through resolveProject(), which fixes
+ *     casing against existing projects and refuses working-directory names.
  */
 
-import { queueReview } from "./state.mjs";
+import { log, queueReview } from "./state.mjs";
 import { canonicalProject } from "./summarize.mjs";
+import { isNonProjectName } from "../extensions/pi-mempalace/memory_store.ts";
 
 const AUTO_IMPORTANCE_CAP = 0.85;
 const DUP_SIMILARITY = 0.92;
 
 export async function applyResult(store, candidate, result, reviewItems, opts = {}) {
   const dry = !!opts.dryRun;
-  const counts = { saved: 0, kg_added: 0, superseded: 0, kg_invalidated: 0, queued: 0, dup_skipped: 0, playbook_saved: 0, playbook_queued: 0 };
+  const counts = { saved: 0, kg_added: 0, superseded: 0, kg_invalidated: 0, queued: 0, dup_skipped: 0, playbook_saved: 0, playbook_queued: 0, stale_dropped: 0, bad_project: 0 };
   const projects = safeProjects(store);
   const src = `session-watchdog:${candidate.source}`;
+  const project_ = (name) => {
+    const p = resolveProject(name, candidate.project, projects);
+    if (!p) counts.bad_project++;
+    return p;
+  };
 
   for (const m of result.memories) {
     if (!m?.content || typeof m.content !== "string") continue;
-    const project = canonicalProject(m.project || candidate.project, projects);
+    const project = project_(m.project);
+    if (!project) continue;
     const importance = Math.min(Number(m.importance) || 0.6, AUTO_IMPORTANCE_CAP);
     if (await isNearDuplicate(store, m.content)) {
       counts.dup_skipped++;
@@ -58,6 +72,8 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
   for (const l of result.lessons || []) {
     if (!l?.content || typeof l.content !== "string") continue;
     if (!l?.trigger) continue; // a lesson with no trigger is unactionable
+    const lessonProject = project_(l.project);
+    if (!lessonProject) continue;
     if (await isNearDuplicate(store, l.content)) {
       counts.dup_skipped++;
       continue;
@@ -67,7 +83,7 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
       "lesson",
       {
         content: l.content.trim(),
-        project: canonicalProject(l.project || candidate.project, projects),
+        project: lessonProject,
         topic: "lessons",
         trigger: String(l.trigger).trim(),
         importance: 0.85,
@@ -87,12 +103,13 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
   // apply.mjs has NO filesystem access to the Obsidian vault (only ever calls
   // store.store()/addTriple()/delete() — see the file's own imports/methods),
   // so any vault-bound destination must be queued for the live agent to apply
-  // with its own judgment (session-watchdog.ts's review notice), never guessed
+  // with its own judgment when a human walks the review queue, never guessed
   // at here.
   for (const p of result.playbook || []) {
     if (!p?.content || typeof p.content !== "string") continue;
     if (!p?.kind || !p?.destination) continue; // both required to route correctly
-    const project = canonicalProject(p.project || candidate.project, projects);
+    const project = project_(p.project);
+    if (!project) continue;
 
     const needsVaultRoute = p.destination === "vault" || p.destination === "both" || p.destination === "unsure";
     const isFactual = p.kind === "command" || p.kind === "location";
@@ -154,6 +171,8 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
 
   for (const f of result.kg_facts) {
     if (!f?.subject || !f?.predicate || !f?.object) continue;
+    const factProject = project_(f.project);
+    if (!factProject) continue;
     if (!dry) {
       try {
         // skip exact-duplicate active facts
@@ -163,7 +182,7 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
           predicate: f.predicate,
           object: f.object,
           valid_from: f.from || undefined,
-          project: canonicalProject(f.project || candidate.project, projects),
+          project: factProject,
         });
       } catch {
         continue;
@@ -175,10 +194,25 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
   for (const s of result.supersedes) {
     if (!s?.forget_memory_id || !s?.replacement_content) continue;
     const target = findMemory(store, s.forget_memory_id);
-    const destructiveOk =
-      s.confidence === "high" && target && Number(target.importance) < AUTO_IMPORTANCE_CAP;
+    if (!target) {
+      // The memory it would replace is already gone (deleted, or superseded
+      // by an earlier tick): there is nothing left to decide.
+      counts.stale_dropped++;
+      continue;
+    }
+    const supProject = project_(s.project);
+    if (!supProject) continue;
+    const destructiveOk = s.confidence === "high" && Number(target.importance) < AUTO_IMPORTANCE_CAP;
     if (!destructiveOk) {
-      queueReview(reviewItems, "supersede", s, s.evidence, candidate.key);
+      // One pending supersede per target: the newer proposal carries the newer
+      // evidence, so it replaces any older one still waiting for review.
+      const before = reviewItems.length;
+      for (let i = reviewItems.length - 1; i >= 0; i--) {
+        const r = reviewItems[i];
+        if (r.kind === "supersede" && sameMemoryFamily(r.payload?.forget_memory_id, s.forget_memory_id)) reviewItems.splice(i, 1);
+      }
+      if (reviewItems.length < before) log(`queue: supersede for ${s.forget_memory_id} replaced ${before - reviewItems.length} older pending proposal(s)`);
+      queueReview(reviewItems, "supersede", { ...s, project: supProject }, s.evidence, candidate.key);
       counts.queued++;
       continue;
     }
@@ -187,7 +221,7 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
         store.delete(s.forget_memory_id);
         await store.store({
           content: s.replacement_content.trim(),
-          project: canonicalProject(s.project || candidate.project, projects),
+          project: supProject,
           topic: cleanTopic(s.topic || target.topic),
           source: src,
           importance: Math.min(Number(s.importance) || Number(target.importance) || 0.6, AUTO_IMPORTANCE_CAP),
@@ -201,8 +235,14 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
 
   for (const inv of result.kg_invalidations) {
     if (!inv?.subject || !inv?.predicate || !inv?.object) continue;
+    let replProject;
+    if (inv.replacement?.subject) {
+      replProject = project_(inv.replacement.project);
+      if (!replProject) continue;
+    }
     if (inv.confidence !== "high") {
-      queueReview(reviewItems, "kg_invalidate", inv, inv.evidence, candidate.key);
+      const queued = inv.replacement?.subject ? { ...inv, replacement: { ...inv.replacement, project: replProject } } : inv;
+      queueReview(reviewItems, "kg_invalidate", queued, inv.evidence, candidate.key);
       counts.queued++;
       continue;
     }
@@ -217,7 +257,7 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
             predicate: inv.replacement.predicate,
             object: inv.replacement.object,
             valid_from: inv.replacement.from || undefined,
-            project: canonicalProject(inv.replacement.project || candidate.project, projects),
+            project: replProject,
           });
         }
       } catch {
@@ -234,6 +274,33 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
   }
 
   return counts;
+}
+
+/**
+ * The project a write or queued item is filed under, or null to refuse it.
+ *
+ * canonicalProject() only fixes casing against projects already in the store,
+ * which is how `shashank.j` and `Documents` kept getting through after the
+ * v0.8.8 guard: that guard (isNonProjectName) was wired into the CLI and the
+ * pi tools, never into this path, and both names already exist as projects,
+ * so canonicalProject happily returned them. A model-supplied name that is a
+ * working directory falls back to the session's own project; if that is one
+ * too, the item is refused. A case variant of the session project
+ * (`standardspec` in a `StandardSpec` checkout) takes the session's spelling.
+ */
+export function resolveProject(name, sessionProject, projects) {
+  const session = sessionProject ? canonicalProject(sessionProject, projects) : null;
+  const sessionOk = session && !isNonProjectName(session) ? session : null;
+  if (!name) return sessionOk;
+  if (sessionOk && String(name).toLowerCase() === sessionOk.toLowerCase()) return sessionOk;
+  const canon = canonicalProject(String(name).trim(), projects);
+  if (!isNonProjectName(canon)) return canon;
+  return sessionOk;
+}
+
+function sameMemoryFamily(a, b) {
+  if (!a || !b) return false;
+  return String(a).replace(/_c\d+$/, "") === String(b).replace(/_c\d+$/, "");
 }
 
 function safeProjects(store) {
@@ -264,10 +331,15 @@ function findMemory(store, id) {
     const hit = r.results.find((m) => m.id === id);
     if (hit) return hit;
   } catch {}
-  // recall window may miss it; fall back to existence check only
+  // recall window may miss it; fall back to existence check only. Family-aware
+  // (`mem_x` and its chunks `mem_x_c0…` are one memory, and store.delete()
+  // treats them that way), so a proposal naming a chunk id is not "missing".
   try {
-    return store.has(id) ? { importance: 1.0, topic: "unknown" } : null; // unknown importance ⇒ treated as high ⇒ queued
+    const family = String(id).replace(/_c\d+$/, "");
+    const exists = store.has(id) || store.has(family) || store.has(`${family}_c0`);
+    return exists ? { importance: 1.0, topic: "unknown" } : null; // unknown importance ⇒ treated as high ⇒ queued
   } catch {
-    return null;
+    // Lookup failed: treat as present so a store error never silently drops a proposal.
+    return { importance: 1.0, topic: "unknown" };
   }
 }

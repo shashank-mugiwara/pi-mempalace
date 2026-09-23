@@ -22,7 +22,15 @@
  *   - prompt < 30 chars or /slash  -> exit (nothing to explore)
  *
  * Register in ~/.claude/settings.json under hooks.UserPromptSubmit with a
- * timeout >= 120 (the subagent is capped at 90s internally).
+ * timeout >= 90 (the subagent is capped at 60s internally).
+ *
+ * Latency (2026-09-23 audit D6): the nested run took a median 38s (max 54s)
+ * on the first prompt of every session. It loaded every hook, plugin and MCP
+ * server, the full coding-agent system prompt and CLAUDE.md/rules, thought
+ * with Claude Code's default Haiku budget (63,999 tokens) on every turn, and
+ * persisted a transcript (145 junk sessions under ~/.claude/projects/
+ * -private-var-folders-…). The spawn below is now isolated and bounded; see
+ * runSubagent for each flag.
  */
 
 import { spawnSync } from "node:child_process";
@@ -36,7 +44,14 @@ const DB = join(
   process.env.MEMPALACE_HOME || join(homedir(), ".pi", "agent", "memory"),
   "memories.db"
 );
-const SUBAGENT_TIMEOUT_MS = 90_000;
+const SUBAGENT_TIMEOUT_MS = 60_000;
+const SUBAGENT_MAX_TURNS = 8;
+/** Extended-thinking budget per turn. Claude Code's Haiku default is 63,999;
+ *  the explorer's judgment is "which of these memories matter", not proofs. */
+const SUBAGENT_THINKING_TOKENS = 2048;
+const SUBAGENT_SYSTEM_PROMPT =
+  "You are a memory-recall subagent. Use the Bash tool only to run the memory-palace CLI " +
+  "commands named in the user message, then answer exactly in the format it asks for.";
 const MAX_CONTEXT_CHARS = 2400;
 
 function out(text) {
@@ -64,9 +79,9 @@ ${prompt.slice(0, 2000)}
 A shared cross-agent memory palace (SQLite, past sessions of pi/Claude Code/opencode/codex) is available via:
   node ${CLI} <command>
 
-Explore it and return ONLY context genuinely relevant to this message. Method — explore, don't one-shot:
+Explore it and return ONLY context genuinely relevant to this message. Method — explore, don't one-shot. You have at most ${SUBAGENT_MAX_TURNS} turns, so chain independent commands in ONE Bash call with \`;\` (e.g. projects plus two searches):
 1. \`projects\` — see which projects/counts exist; note ones related to "${project}" or to entities in the prompt.
-2. \`search "<query>" -n 6\` — run 2-4 searches with DIFFERENT phrasings/angles of the user's intent (natural language, not keywords). Try both with and without \`--project ${project}\`.
+2. \`search "<query>" -n 6\` — run 2-3 searches with DIFFERENT phrasings/angles of the user's intent (natural language, not keywords). Try both with and without \`--project ${project}\`.
 3. \`kg-query "<entity>"\` for concrete entities (services, tools, projects) named in the prompt or surfaced by search.
 4. \`recall --project ${project} -n 8\` — recent memories for this project.
 
@@ -82,18 +97,31 @@ function runSubagent(prompt, project) {
     "claude",
     [
       "-p",
-      buildSubagentPrompt(prompt, project),
-      "--model",
-      "claude-haiku-4-5",
-      "--allowedTools",
-      "Bash(node:*)",
-      "--max-turns",
-      "14",
+      "--model", "claude-haiku-4-5",
+      // Never persisted: these transcripts are noise in ~/.claude/projects,
+      // and the session-watchdog reads that directory.
+      "--no-session-persistence",
+      // No MCP servers, hooks, plugins or user settings (startup 7.1s → 2.9s).
+      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+      "--setting-sources", "",
+      // Bash only, and only `node …` runs without a prompt.
+      "--tools", "Bash",
+      "--allowedTools", "Bash(node:*)",
+      "--disable-slash-commands",
+      "--system-prompt", SUBAGENT_SYSTEM_PROMPT,
+      "--max-turns", String(SUBAGENT_MAX_TURNS),
     ],
     {
+      input: buildSubagentPrompt(prompt, project),
       encoding: "utf8",
       timeout: SUBAGENT_TIMEOUT_MS,
-      env: { ...process.env, MEMPALACE_EXPLORER: "1" },
+      env: {
+        ...process.env,
+        MEMPALACE_EXPLORER: "1",
+        CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+        MAX_THINKING_TOKENS: String(SUBAGENT_THINKING_TOKENS),
+      },
       cwd: tmpdir(),
     }
   );

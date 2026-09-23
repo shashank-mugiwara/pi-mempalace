@@ -17,7 +17,7 @@
  *   and automatically from `tick` when the last pass is > 30 days old.
  */
 
-import { runTerra, canonicalProject } from "./summarize.mjs";
+import { runCurator, canonicalProject } from "./summarize.mjs";
 import { queueReview, log } from "./state.mjs";
 
 export const SINGLETON_TOPICS = ["session-resume", "todo-state", "playbook"];
@@ -95,7 +95,7 @@ export async function consolidateProject(store, project, cfg, review, opts = {})
   );
   for (const [i, lines] of batches.entries()) {
     const t0 = Date.now();
-    const run = runTerra(buildPrompt(canon, lines), { model: cfg.model, effort: cfg.effort, timeoutMs: cfg.timeoutMs, raw: true });
+    const run = runCurator(buildPrompt(canon, lines), { model: cfg.model, effort: cfg.effort, thinkingTokens: cfg.thinkingTokens, timeoutMs: cfg.timeoutMs, raw: true });
     if (!run.ok) {
       counts.failed++;
       log(`consolidate ${canon} batch ${i + 1}/${batches.length} FAILED: ${run.error}`);

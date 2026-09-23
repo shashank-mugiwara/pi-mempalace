@@ -1,5 +1,51 @@
 # Fork changelog
 
+## 0.8.9 — 2026-09-23 — watchdog on Claude Haiku 4.5; isolated nested `claude -p`; queue hygiene
+
+From the 2026-09-23 harness audit and Shashank's instruction "haiku 4.5 model
+with high effort. No OpenAI models".
+
+- **Curator model.** `runTerra` (gpt-5.6-terra via `codex exec`) is replaced by
+  `runCurator` in `watchdog/summarize.mjs`: `claude -p --model claude-haiku-4-5
+  --output-format json`, reusing Claude Code's OAuth/keychain login. Haiku 4.5
+  rejects the API `effort` parameter, so "high" is an extended-thinking budget:
+  `MAX_THINKING_TOKENS=16384` (pi's own table: low 2048, medium 8192, high
+  16384, xhigh 32000, max 63999). Checked through a logging proxy against Claude
+  Code 2.1.280: for Haiku, `--effort` is accepted but never sent (every level
+  went out as `budget_tokens: 63999`); `MAX_THINKING_TOKENS` sets the budget.
+  Non-Haiku overrides get `--effort` instead. Config keys `watchdogModel` /
+  `watchdogEffort` still work; new `watchdogThinkingTokens`.
+- **Isolation** on every nested call (watchdog and first-prompt explorer):
+  `--no-session-persistence` (the collectors read `~/.claude/projects`, so a
+  persisted run would be fed back into the watchdog), `--strict-mcp-config` with
+  an empty `--mcp-config`, `--setting-sources ""`, `--disable-slash-commands`, a
+  short `--system-prompt`, `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`,
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `MEMPALACE_EXPLORER=1`, cwd tmpdir, prompt
+  on stdin. The curator runs with `--tools ""`. Per-call overhead fell from ~6.6k to ~0.5k
+  input tokens. Not `--bare`: it refuses OAuth/keychain auth.
+- **First-prompt explorer** (`hooks/claude-first-prompt-explorer.mjs`): the
+  isolation above, `--tools Bash`, `--max-turns` 14 → 8, a 2,048-token
+  thinking budget (Claude Code's Haiku default was 63,999 per turn), timeout
+  90s → 60s. One realistic prism prompt: 41.0s before, 20.1s after, same
+  recalled facts.
+- **Collectors** skip Claude Code project dirs named for temp cwds
+  (`-private-var-folders-…`, `-tmp…`) before reading or seeding them. They had
+  145 of the explorer's persisted transcripts; `isTempCwd()` already kept those
+  away from the summarizer (0 summarized), but only via the cwd inside each file.
+- **Queue hygiene** (`watchdog/apply.mjs`, audit D7, 158 items pending): a
+  supersede whose target memory is gone is dropped instead of queued; one pending
+  supersede per target (the newer replaces the older); every write and queued
+  item goes through `resolveProject()`. The 0.8.8 guard (`isNonProjectName`) was
+  wired into the CLI and pi tools but never into the watchdog, and
+  `canonicalProject()` returned `shashank.j` / `Documents` because both already
+  exist as projects. Working-directory names now fall back to the session's
+  project or are refused; case variants take the session's spelling.
+  `findMemory()` is chunk-family aware (`mem_x_c0` exists if `mem_x` does).
+- **session-watchdog.ts** keeps only `/memory-watchdog`. Its in-process 15-min
+  timer duplicated launchd and only ever lost the lock; its first-turn "Memory
+  review pending" block repeated the health canary and changed the system
+  prompt after turn one (a prompt-cache miss).
+
 ## 0.8.8 — 2026-09-05 — the knowledge graph finally reads its own `is_a` facts; writers refuse non-projects
 
 Found by the 2026-09-04 memory-harness audit: 405 of 658 entities were typed

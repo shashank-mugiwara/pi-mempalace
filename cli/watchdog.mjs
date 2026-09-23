@@ -5,16 +5,17 @@
  * Reads new dialogue from Claude Code / pi / codex (JSONL) and opencode
  * (SQLite) session stores since per-session watermarks, gates on "worth it"
  * (>= 10KB new dialogue AND quiet >= 5 min), summarizes each passing delta
- * with gpt-5.6-terra (high effort, via `codex exec`), and applies the result
- * under the additive-auto / destructive-queued policy. Scheduled every 15 min
- * by the session-watchdog pi extension; equally runnable by hand.
+ * with Claude Haiku 4.5 (extended thinking "high", via an isolated nested
+ * `claude -p` — see runCurator in watchdog/summarize.mjs), and applies the
+ * result under the additive-auto / destructive-queued policy. Scheduled every
+ * 15 min by launchd (com.shashank.mempalace-watchdog); equally runnable by hand.
  *
  * Commands:
  *   tick [--dry-run] [--limit N] [--backfill HOURS] [--verbose]
  *       One pass: seed new sources, collect, gate, summarize, apply.
- *       --dry-run: full pipeline INCLUDING terra calls but no store writes
- *                  and no watermark advance. Add --no-model to also skip terra
- *                  and just print what would be summarized.
+ *       --dry-run: full pipeline INCLUDING model calls but no store writes
+ *                  and no watermark advance. Add --no-model to also skip the
+ *                  model and just print what would be summarized.
  *   status            Watermark + queue overview.
  *   review            List pending review-queue items (--json).
  *   apply-review --approve id1,id2 --reject id3,...
@@ -22,8 +23,9 @@
  *
  * Config overrides (~/.pi/agent/memory/config.json, all optional):
  *   watchdogMinNewChars (10240), watchdogQuietMs (300000),
- *   watchdogMaxPerTick (4), watchdogModel ("gpt-5.6-terra"),
- *   watchdogEffort ("high"), watchdogActiveWithinMs (86400000)
+ *   watchdogMaxPerTick (4), watchdogModel ("claude-haiku-4-5"),
+ *   watchdogEffort ("high" — a thinking budget on Haiku, --effort on others),
+ *   watchdogThinkingTokens (overrides the Haiku budget), watchdogActiveWithinMs (86400000)
  */
 
 import { readFileSync } from "node:fs";
@@ -33,7 +35,7 @@ import {
   acquireLock, releaseLock, log, REVIEW_PATH,
 } from "../watchdog/state.mjs";
 import { collectAll, seedNewSources } from "../watchdog/collectors.mjs";
-import { gatherContext, buildPrompt, runTerra, canonicalProject } from "../watchdog/summarize.mjs";
+import { gatherContext, buildPrompt, runCurator, canonicalProject } from "../watchdog/summarize.mjs";
 import { applyResult } from "../watchdog/apply.mjs";
 import { consolidateProject, dueProjects, CONSOLIDATE_EVERY_MS } from "../watchdog/consolidate.mjs";
 import { MemoryStore } from "../extensions/pi-mempalace/memory_store.ts";
@@ -47,10 +49,11 @@ function config() {
     minNewChars: user.watchdogMinNewChars ?? 10_240,
     quietMs: user.watchdogQuietMs ?? 5 * 60 * 1000,
     maxPerTick: user.watchdogMaxPerTick ?? 4,
-    model: user.watchdogModel ?? "gpt-5.6-terra",
+    model: user.watchdogModel ?? "claude-haiku-4-5",
     effort: user.watchdogEffort ?? "high",
+    thinkingTokens: user.watchdogThinkingTokens,
     activeWithinMs: user.watchdogActiveWithinMs ?? 24 * 60 * 60 * 1000,
-    // 21 of the first 329 failures were ETIMEDOUT at 300s on high effort.
+    // 21 of the first 329 terra failures were ETIMEDOUT at 300s on high effort.
     timeoutMs: user.watchdogTimeoutMs ?? 600_000,
     // Consolidation: memories older than this are eligible for merge/demote.
     minAgeDays: user.watchdogConsolidateMinAgeDays ?? 45,
@@ -128,9 +131,9 @@ async function cmdTick(opts) {
       const prompt = buildPrompt(c, ctx);
       log(`summarizing ${c.source}/${c.project} (${c.rawTextLength} chars) with ${cfg.model}/${cfg.effort}`);
       const t0 = Date.now();
-      const run = runTerra(prompt, { model: cfg.model, effort: cfg.effort, timeoutMs: cfg.timeoutMs });
+      const run = runCurator(prompt, { model: cfg.model, effort: cfg.effort, thinkingTokens: cfg.thinkingTokens, timeoutMs: cfg.timeoutMs });
       if (!run.ok) {
-        log(`terra FAILED for ${c.key}: ${run.error} — watermark NOT advanced, retry next tick`);
+        log(`model FAILED (${cfg.model}) for ${c.key}: ${run.error} — watermark NOT advanced, retry next tick`);
         console.log(`  ✗ ${c.source}/${c.project}: ${run.error}`);
         continue;
       }
@@ -279,9 +282,8 @@ async function cmdApplyReview(opts) {
         // Vault write is NOT done here — apply-review is a human/CLI path with
         // no vault-write competence either (same reason apply.mjs never
         // auto-applies vault-bound entries). If destination includes "vault",
-        // the human (or the live agent, per session-watchdog.ts's review
-        // notice) writes the note by hand/tool; this only persists the
-        // memory-side copy.
+        // the human (or the live agent walking the queue with them) writes
+        // the note by hand/tool; this only persists the memory-side copy.
         await store.store({
           content: p.content.trim(),
           project: p.project || "general",

@@ -1,14 +1,16 @@
 /**
  * summarize.mjs — turn one session delta into curated store updates via
- * gpt-5.6-terra (high reasoning effort), invoked through `codex exec` so it
- * reuses the existing ChatGPT auth in ~/.codex/auth.json.
+ * Claude Haiku 4.5 with extended thinking ("high"), invoked through a nested
+ * `claude -p` so it reuses Claude Code's existing OAuth/keychain login.
+ * (gpt-5.6-terra via `codex exec` until 2026-09-23 — Shashank: "haiku 4.5
+ * with high effort, no OpenAI models".)
  *
  * The model gets: the transcript delta, the store's current related memories
  * (WITH ids + importance so supersedes can target real ids), related KG
  * facts, a read-only excerpt of the Obsidian vault's project hub note, and
  * the write conventions from PROTOCOL.md. It must return STRICT JSON.
  *
- * Fail-closed: any codex failure / unparseable output → null (the tick skips
+ * Fail-closed: any model failure / unparseable output → null (the tick skips
  * the candidate WITHOUT advancing its watermark, so nothing is ever lost —
  * it retries next tick).
  */
@@ -23,10 +25,26 @@ const FORK = join(homedir(), ".pi", "agent", "pi-mempalace-fork");
 const VAULT = process.env.WATCHDOG_VAULT || join(homedir(), "Desktop", "shashank");
 
 export const DEFAULTS = {
-  model: "gpt-5.6-terra",
+  model: "claude-haiku-4-5",
   effort: "high",
-  timeoutMs: 300_000,
+  timeoutMs: 600_000,
 };
+
+/**
+ * Haiku 4.5 has no API `effort` parameter (the API rejects it), so "effort"
+ * becomes an extended-thinking budget. Measured against Claude Code 2.1.280
+ * through a logging proxy on 2026-09-23: for Haiku, `--effort` is accepted
+ * but never reaches the request (every level sent budget_tokens 63999, the
+ * CLI default); MAX_THINKING_TOKENS is what sets `thinking.budget_tokens`,
+ * and 0 turns thinking off. Budgets match pi's own thinking-level table
+ * (pi-ai simple-options.ts), so "high" means the same thing in both places.
+ * Models with adaptive thinking (Sonnet/Opus) get `--effort` instead.
+ */
+const HAIKU_THINKING_BUDGET = { off: 0, minimal: 1024, low: 2048, medium: 8192, high: 16384, xhigh: 32000, max: 63999 };
+
+const CURATOR_SYSTEM_PROMPT =
+  "You are a careful, precise curator for a shared cross-agent memory store. " +
+  "Follow the instructions in the user message exactly and output only what they ask for.";
 
 // ---------------------------------------------------------------------------
 // Context gathering (store + vault)
@@ -210,39 +228,70 @@ correct far more often than not.
 }
 
 // ---------------------------------------------------------------------------
-// codex exec invocation
+// claude -p invocation
 // ---------------------------------------------------------------------------
 
-export function runTerra(prompt, opts = {}) {
+/**
+ * Isolation flags, each load-bearing:
+ *   --no-session-persistence  the collectors read ~/.claude/projects; a
+ *                             persisted run would be fed back into the
+ *                             watchdog as a new "session" next tick
+ *   --strict-mcp-config + empty --mcp-config, --setting-sources ""
+ *                             no MCP servers, hooks, plugins or user settings
+ *                             (startup measured 7.1s → 2.9s)
+ *   --tools ""                no tools: the curator only reads its prompt
+ *   --system-prompt + CLAUDE_CODE_DISABLE_CLAUDE_MDS/AUTO_MEMORY
+ *                             drops the coding-agent prompt and CLAUDE.md /
+ *                             rules files (~6.6k → ~0.5k input tokens of
+ *                             overhead per call)
+ *   MEMPALACE_EXPLORER=1      Claude Code's first-prompt explorer hook exits
+ *                             immediately for nested runs
+ * Not --bare: it refuses OAuth/keychain auth, which is how this machine logs in.
+ */
+export function runCurator(prompt, opts = {}) {
   const model = opts.model || DEFAULTS.model;
   const effort = opts.effort || DEFAULTS.effort;
-  const outFile = join(tmpdir(), `watchdog-terra-${process.pid}-${Date.now()}.txt`);
+  const isHaiku = /haiku/i.test(model);
   const args = [
-    "exec",
-    "--sandbox", "read-only",
-    "--skip-git-repo-check",
-    "-m", model,
-    "-c", `model_reasoning_effort="${effort}"`,
-    "--output-last-message", outFile,
-    "-",
+    "-p",
+    "--model", model,
+    "--output-format", "json",
+    "--no-session-persistence",
+    "--strict-mcp-config",
+    "--mcp-config", '{"mcpServers":{}}',
+    "--setting-sources", "",
+    "--tools", "",
+    "--disable-slash-commands",
+    "--system-prompt", CURATOR_SYSTEM_PROMPT,
   ];
-  const res = spawnSync("codex", args, {
+  if (!isHaiku) args.push("--effort", effort);
+  const env = {
+    ...process.env,
+    MEMPALACE_EXPLORER: "1",
+    CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+  };
+  if (isHaiku) env.MAX_THINKING_TOKENS = String(opts.thinkingTokens ?? HAIKU_THINKING_BUDGET[effort] ?? HAIKU_THINKING_BUDGET.high);
+  const res = spawnSync("claude", args, {
     input: prompt,
     encoding: "utf8",
     timeout: opts.timeoutMs || DEFAULTS.timeoutMs,
     cwd: tmpdir(),
-    env: { ...process.env, MEMPALACE_EXPLORER: "1" },
+    env,
+    maxBuffer: 32 * 1024 * 1024,
   });
   if (res.error) return { ok: false, error: String(res.error) };
-  let text = "";
+  let envelope = null;
   try {
-    text = readFileSync(outFile, "utf8");
+    envelope = JSON.parse(res.stdout || "");
   } catch {
-    text = res.stdout || "";
+    /* not JSON: CLI failed before producing a result */
   }
-  if (res.status !== 0 && !text.trim()) {
-    return { ok: false, error: `codex exit ${res.status}: ${(res.stderr || "").slice(-400)}` };
+  if (!envelope || envelope.is_error || envelope.subtype !== "success") {
+    const why = envelope ? `${envelope.subtype || "error"}: ${String(envelope.result || "").slice(0, 300)}` : (res.stderr || res.stdout || "").slice(-400);
+    return { ok: false, error: `claude exit ${res.status}: ${why}` };
   }
+  const text = String(envelope.result || "");
   const parsed = extractJson(text);
   if (!parsed) return { ok: false, error: "unparseable model output: " + text.slice(0, 200) };
   // `raw` callers (consolidate.mjs) bring their own schema; normalize() would

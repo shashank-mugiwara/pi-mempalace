@@ -178,14 +178,15 @@ goes in the KG (they complement, don't duplicate).
 
 ## Background curation (session-watchdog, fork ≥0.8.0)
 
-A 15-minute watchdog (scheduled by the `session-watchdog` pi extension,
+A 15-minute watchdog (scheduled by launchd, `com.shashank.mempalace-watchdog`;
 runnable manually via `cli/watchdog.mjs tick`) reads new dialogue from ALL
 four agents' session stores, summarizes worth-it deltas (≥10KB new dialogue,
-5 min quiet) with gpt-5.6-terra via `codex exec`, and applies results under
+5 min quiet) with Claude Haiku 4.5 (extended thinking "high") via an isolated
+nested `claude -p`, and applies results under
 **additive auto, destructive queued**: new memories/facts land automatically
 (importance clamped ≤0.85, dupe-guarded); anything destructive, low-confidence,
 or touching an importance ≥0.85 memory waits in `watchdog-review.json` for the
-human's AskUserQuestion verdict at the next pi session. pi's memory-summarizer
+human's verdict (every agent's harness health canary announces the queue). pi's memory-summarizer
 auto-distill is retired in favor of this (manual `/memory-summarize` remains).
 Agents should still save pivotal decisions inline as they happen — the
 watchdog is a safety net and curator, not an excuse to skip deliberate saves.

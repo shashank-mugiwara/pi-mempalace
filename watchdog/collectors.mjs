@@ -147,10 +147,21 @@ function claudeCwd(path) {
   return null;
 }
 
+/**
+ * Claude Code project dirs that are temp cwds (`-private-var-folders-…`,
+ * `-tmp-…`). Before 2026-09-23 the first-prompt explorer's nested `claude -p`
+ * persisted its transcripts there (145 files, 17 MB). isTempCwd() already kept
+ * them away from the summarizer, but only via the cwd inside the file — a
+ * file whose first 25 lines carry no cwd fell through as project "general".
+ * Matching the directory name skips them before any file is read.
+ */
+const CLAUDE_TEMP_PROJECT_DIR = /^-(private-var-folders-|var-folders-|private-tmp(-|$)|tmp(-|$))/;
+
 export function collectClaude(state, activeWithinMs) {
   const files = globSync(join(HOME, ".claude", "projects", "*", "*.jsonl"));
   const out = [];
   for (const f of files) {
+    if (CLAUDE_TEMP_PROJECT_DIR.test(basename(join(f, "..")))) continue;
     const st = statSync(f);
     if (Date.now() - st.mtimeMs > activeWithinMs) continue;
     const cwd = claudeCwd(f);
@@ -362,6 +373,7 @@ export function seedNewSources(state, backfillMs = 0) {
   for (const g of jsonlGlobs) {
     for (const f of globSync(g)) {
       if (state.files[f]) continue;
+      if (f.includes(`${join(HOME, ".claude", "projects")}/`) && CLAUDE_TEMP_PROJECT_DIR.test(basename(join(f, "..")))) continue;
       let size = 0;
       try {
         const st = statSync(f);
@@ -404,8 +416,8 @@ export function seedNewSources(state, backfillMs = 0) {
 
 /**
  * Sessions run from temp directories are our own machinery — the watchdog's
- * codex-exec terra calls and Claude Code's first-prompt explorer subagent
- * both run with cwd=tmpdir. Summarizing them would make the watchdog eat its
+ * nested `claude -p` curator calls and Claude Code's first-prompt explorer
+ * subagent both run with cwd=tmpdir. Summarizing them would make the watchdog eat its
  * own output in a loop. Their watermarks still advance via the zero-dialogue
  * noise path or stay parked; they never reach the summarizer.
  */
@@ -425,7 +437,7 @@ function isTempCwd(cwd) {
 // Claude Code keeps its own per-project file memory, written by the model as
 // it works. It is a third store nothing synced: by 2026-09-02 prism had 42
 // such files and weaver 21 that never reached the palace. Each project's
-// changed notes become one candidate; terra distills them like a transcript
+// changed notes become one candidate; the curator distills them like a transcript
 // but with a lower floor, since the notes are already dense.
 //
 // Watermark: per-file mtime (files are rewritten in place, so byte offsets
