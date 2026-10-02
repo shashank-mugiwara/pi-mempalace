@@ -20,6 +20,13 @@
  *   review            List pending review-queue items (--json).
  *   apply-review --approve id1,id2 --reject id3,...
  *       Apply approved destructive items to the store, drop rejected ones.
+ *       Takes watchdog.lock first (waits up to WATCHDOG_LOCK_WAIT_MS, default
+ *       120000, then exits 1 with nothing applied), sweeps dead and outranked
+ *       supersedes the human did not name, and logs one line per run to
+ *       watchdog.log. Items whose project does not resolve stay queued.
+ *
+ * Every writer of watchdog-review.json (tick, consolidate, apply-review) holds
+ * watchdog.lock from the moment it reads the queue until it saves it.
  *
  * Config overrides (~/.pi/agent/memory/config.json, all optional):
  *   watchdogMinNewChars (10240), watchdogQuietMs (300000),
@@ -31,12 +38,13 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  MEM_HOME, loadState, saveState, loadReview, saveReview, recordRejections,
-  acquireLock, releaseLock, log, REVIEW_PATH,
+  MEM_HOME, loadState, saveState, loadReview, saveReview, recordRejections, recordSwept,
+  acquireLock, acquireLockWait, refreshLock, releaseLock, lockHolder, rotateLogs, log, REVIEW_PATH,
 } from "../watchdog/state.mjs";
 import { collectAll, seedNewSources } from "../watchdog/collectors.mjs";
 import { gatherContext, buildPrompt, runCurator, canonicalProject } from "../watchdog/summarize.mjs";
 import { applyResult } from "../watchdog/apply.mjs";
+import { applyReviewItems, sweepQueue } from "../watchdog/review.mjs";
 import { consolidateProject, dueProjects, CONSOLIDATE_EVERY_MS } from "../watchdog/consolidate.mjs";
 import { MemoryStore } from "../extensions/pi-mempalace/memory_store.ts";
 
@@ -66,6 +74,7 @@ function config() {
 async function runConsolidation(store, state, review, cfg, projects, opts = {}) {
   const totals = { merges: 0, demotions: 0, deletions: 0, failed: 0 };
   for (const project of projects) {
+    refreshLock();
     const c = await consolidateProject(store, project, cfg, review, opts);
     totals.merges += c.merges; totals.demotions += c.demotions; totals.deletions += c.deletions; totals.failed += c.failed;
     console.log(`  consolidate ${project}: ${c.batches} batch(es) → merges ${c.merges}, demotions ${c.demotions}, deletions ${c.deletions}${c.failed ? `, failed ${c.failed}` : ""}${opts.dryRun ? " [DRY RUN]" : ""}`);
@@ -78,6 +87,24 @@ async function runConsolidation(store, state, review, cfg, projects, opts = {}) 
   return totals;
 }
 
+/**
+ * Sweep the queue under the lock: drop supersedes whose target is gone and
+ * older proposals outranked by a newer one for the same target. Saves only
+ * when something was dropped and this is not a dry run.
+ */
+function sweepUnderLock(store, { exempt, dryRun } = {}) {
+  const review = loadReview();
+  const { review: kept, dropped } = sweepQueue(store, review, { exempt });
+  for (const d of dropped) {
+    log(`sweep: dropped ${d.item.id} (${d.item.kind}, ${d.item.payload?.project || "?"}) — ${d.reason}`);
+  }
+  if (dropped.length && !dryRun) {
+    recordSwept(dropped); // archive first: an item is never in neither file
+    saveReview(kept);
+  }
+  return { before: review, review: kept, dropped };
+}
+
 async function cmdTick(opts) {
   if (!acquireLock()) {
     log("tick: lock held, skipping");
@@ -85,6 +112,16 @@ async function cmdTick(opts) {
     return;
   }
   try {
+    rotateLogs();
+    const store = new MemoryStore();
+    if (!opts["dry-run"]) {
+      try {
+        const sw = sweepUnderLock(store);
+        if (sw.dropped.length) console.log(`swept ${sw.dropped.length} dead or outranked supersede(s) from the review queue`);
+      } catch (e) {
+        log(`sweep FAILED: ${e?.message || e} — queue left as it was`);
+      }
+    }
     const cfg = config();
     const state = loadState();
     const seeded = seedNewSources(state, (Number(opts.backfill) || 0) * 3600 * 1000);
@@ -123,7 +160,6 @@ async function cmdTick(opts) {
       return;
     }
 
-    const store = new MemoryStore();
     const review = loadReview();
     for (const c of eligible) {
       const ctx = await gatherContext(store, c);
@@ -131,6 +167,9 @@ async function cmdTick(opts) {
       const prompt = buildPrompt(c, ctx);
       log(`summarizing ${c.source}/${c.project} (${c.rawTextLength} chars) with ${cfg.model}/${cfg.effort}`);
       const t0 = Date.now();
+      // Heartbeat before each model call (up to cfg.timeoutMs): a live tick
+      // must never look hung to apply-review waiting on the same lock.
+      refreshLock();
       const run = runCurator(prompt, { model: cfg.model, effort: cfg.effort, thinkingTokens: cfg.thinkingTokens, timeoutMs: cfg.timeoutMs });
       if (!run.ok) {
         log(`model FAILED (${cfg.model}) for ${c.key}: ${run.error} — watermark NOT advanced, retry next tick`);
@@ -143,7 +182,7 @@ async function cmdTick(opts) {
         saveState(state);
         saveReview(review);
       }
-      const summary = `saved ${counts.saved}, playbook+${counts.playbook_saved}, kg+${counts.kg_added}, superseded ${counts.superseded}, kg-inv ${counts.kg_invalidated}, queued ${counts.queued + counts.playbook_queued}, dup-skip ${counts.dup_skipped} (${Math.round((Date.now() - t0) / 1000)}s)`;
+      const summary = `saved ${counts.saved}, playbook+${counts.playbook_saved}, kg+${counts.kg_added}, superseded ${counts.superseded}, kg-inv ${counts.kg_invalidated}, queued ${counts.queued + counts.playbook_queued}, dup-skip ${counts.dup_skipped}${counts.currency_skipped ? `, currency-skip ${counts.currency_skipped}` : ""} (${Math.round((Date.now() - t0) / 1000)}s)`;
       log(`applied ${c.source}/${c.project}: ${summary}`);
       console.log(`  ✓ ${c.source}/${c.project}: ${summary}${opts["dry-run"] ? " [DRY RUN — nothing written]" : ""}`);
       if (opts["dry-run"]) console.log(JSON.stringify(run.result, null, 2));
@@ -226,123 +265,82 @@ async function cmdApplyReview(opts) {
     console.error("apply-review needs --approve and/or --reject id lists");
     process.exit(1);
   }
-  const review = loadReview();
-  // Fail before touching anything if an id is not in the queue: a typo or a
-  // stale id used to be ignored silently, which reads as "applied" to the caller.
-  const known = new Set(review.map((r) => r.id));
-  const unknown = [...approve, ...reject].filter((id) => !known.has(id));
-  const both = approve.filter((id) => reject.includes(id));
-  if (unknown.length || both.length) {
-    if (unknown.length) console.error(`not in queue: ${unknown.join(", ")}`);
-    if (both.length) console.error(`listed as both approve and reject: ${both.join(", ")}`);
-    console.error(`nothing applied (queue: ${review.length} items; run \`review\` to list ids)`);
-    process.exit(1);
-  }
-  console.log(`applying: ${approve.length} approve, ${reject.length} reject (queue: ${review.length})`);
-  const store = new MemoryStore();
-  const keep = [];
-  const rejected = [];
-  for (const item of review) {
-    if (reject.includes(item.id)) {
-      // Rejections used to be dropped here. They are the only labelled signal
-      // the system gets — a human judging a concrete proposal wrong — so they
-      // are persisted and fed back into the curator prompt, which is what stops
-      // the same inference being re-derived from the same transcript next tick.
-      rejected.push(item);
-      continue;
-    }
-    if (!approve.includes(item.id)) {
-      keep.push(item);
-      continue;
-    }
-    try {
-      if (item.kind === "supersede") {
-        const s = item.payload;
-        try { store.delete(s.forget_memory_id); } catch {}
-        await store.store({
-          content: s.replacement_content.trim(),
-          project: s.project || "general",
-          topic: s.topic || "session-watchdog",
-          source: "session-watchdog:review-approved",
-          importance: Number(s.importance) || 0.7,
-        });
-      } else if (item.kind === "lesson") {
-        const l = item.payload;
-        // Trigger first: a lesson is retrieved when the situation recurs, so
-        // the "when X, check Y" line has to carry the searchable wording.
-        await store.store({
-          content: `LESSON (${l.trigger})\n${l.content.trim()}`,
-          project: l.project || "general",
-          topic: "lessons",
-          source: "session-watchdog:lesson-approved",
-          importance: Number(l.importance) || 0.85,
-        });
-      } else if (item.kind === "playbook") {
-        const p = item.payload;
-        // Vault write is NOT done here — apply-review is a human/CLI path with
-        // no vault-write competence either (same reason apply.mjs never
-        // auto-applies vault-bound entries). If destination includes "vault",
-        // the human (or the live agent walking the queue with them) writes
-        // the note by hand/tool; this only persists the memory-side copy.
-        await store.store({
-          content: p.content.trim(),
-          project: p.project || "general",
-          topic: "playbook",
-          source: "session-watchdog:playbook-approved",
-          importance: Number(p.importance) || 0.7,
-        });
-      } else if (item.kind === "merge") {
-        // Consolidation: several memories → one. Store first so a failed save
-        // never leaves the originals gone.
-        const m = item.payload;
-        const res = await store.store({
-          content: m.replacement_content.trim(),
-          project: m.project || "general",
-          topic: m.topic || "consolidated",
-          source: "session-watchdog:consolidation-approved",
-          importance: Number(m.importance) || 0.7,
-        });
-        if (res.status === "stored" || res.status === "duplicate") {
-          for (const id of m.forget_memory_ids || []) {
-            try { store.delete(id); } catch {}
-          }
-        }
-      } else if (item.kind === "demote") {
-        store.setImportance(item.payload.id, Number(item.payload.importance));
-      } else if (item.kind === "delete") {
-        try { store.delete(item.payload.id); } catch {}
-      } else if (item.kind === "kg_invalidate") {
-        const inv = item.payload;
-        const id = store.findTriple(inv.subject, inv.predicate, inv.object);
-        if (id !== null) store.invalidateTriple(id);
-        if (inv.replacement?.subject) {
-          store.addTriple({
-            subject: inv.replacement.subject,
-            predicate: inv.replacement.predicate,
-            object: inv.replacement.object,
-            valid_from: inv.replacement.from || undefined,
-            project: inv.replacement.project || "general",
-          });
-        }
-      } else {
-        // doubts have no mechanical action; approving one just clears it
-        // (the human acts on it themselves, or dictates a save in-session).
-      }
-      console.log(`applied ${item.id} (${item.kind})`);
-    } catch (e) {
-      console.error(`failed ${item.id}: ${e?.message || e} — kept in queue`);
-      keep.push(item);
-    }
-  }
-  saveReview(keep);
-  recordRejections(rejected);
-  if (rejected.length) {
-    console.log(
-      `rejected: ${rejected.length} recorded to watchdog-rejections.json ` +
-        `(fed back into the curator prompt so they are not re-proposed)`
+  // The tick and consolidation hold this lock from reading the queue to saving
+  // it. Without it, a tick that loaded the queue before this run and saved it
+  // after would silently put back every item approved or rejected here.
+  const waitMs = Number(process.env.WATCHDOG_LOCK_WAIT_MS ?? 120_000);
+  if (!(await acquireLockWait(waitMs))) {
+    const h = lockHolder();
+    console.error(
+      `apply-review: another watchdog run holds the lock` +
+        (h?.pid ? ` (pid ${h.pid}, last heartbeat ${new Date(h.at).toISOString()})` : "") +
+        `; waited ${Math.round(waitMs / 1000)}s. Nothing applied; retry when it finishes.`
     );
+    process.exitCode = 1;
+    return;
   }
-  console.log(`queue: ${keep.length} remaining`);
+  try {
+    // Read only after the lock is held: a tick that finished while we waited
+    // may have changed the queue.
+    const review = loadReview();
+    // Fail before touching anything if an id is not in the queue: a typo or a
+    // stale id used to be ignored silently, which reads as "applied" to the caller.
+    const known = new Set(review.map((r) => r.id));
+    const unknown = [...approve, ...reject].filter((id) => !known.has(id));
+    const both = approve.filter((id) => reject.includes(id));
+    // Two approved supersedes for one target would write two replacements and
+    // delete the target once — the accumulated trail the one-record rule exists
+    // to prevent (bead hx-r8e). Approve one, reject the rest.
+    const byTarget = new Map();
+    for (const r of review) {
+      if (r.kind !== "supersede" || !approve.includes(r.id)) continue;
+      const target = String(r.payload?.forget_memory_id || "").replace(/_c\d+$/, "");
+      if (target) byTarget.set(target, [...(byTarget.get(target) || []), r.id]);
+    }
+    const collisions = [...byTarget].filter(([, ids]) => ids.length > 1);
+    if (unknown.length || both.length || collisions.length) {
+      if (unknown.length) console.error(`not in queue: ${unknown.join(", ")}`);
+      if (both.length) console.error(`listed as both approve and reject: ${both.join(", ")}`);
+      for (const [target, ids] of collisions) console.error(`approved supersedes share target ${target}: ${ids.join(", ")} — approve one, reject the others`);
+      console.error(`nothing applied (queue: ${review.length} items; run \`review\` to list ids)`);
+      process.exitCode = 1;
+      return;
+    }
+    const store = new MemoryStore();
+    // Ids named on this command line are exempt: an explicit verdict outranks
+    // the sweep. Rejections are recorded (they are the only labelled signal);
+    // swept items are not, because no human judged them.
+    const sw = sweepQueue(store, review, { exempt: new Set([...approve, ...reject]) });
+    for (const d of sw.dropped) {
+      log(`sweep: dropped ${d.item.id} (${d.item.kind}, ${d.item.payload?.project || "?"}) — ${d.reason}`);
+      console.log(`swept ${d.item.id} (${d.item.kind}): ${d.reason}`);
+    }
+    recordSwept(sw.dropped); // archived before the swept queue is saved below
+    console.log(`applying: ${approve.length} approve, ${reject.length} reject (queue: ${review.length})`);
+    let projects = {};
+    try {
+      projects = store.listProjects().projects;
+    } catch {}
+    const { keep, rejected, counts, messages } = await applyReviewItems(store, sw.review, { approve, reject, projects });
+    for (const m of messages) (m.level === "error" ? console.error : console.log)(m.text);
+    // Queue last: the store effects above happen first, so a crash in between
+    // leaves an applied item queued, and re-approving it is idempotent.
+    saveReview(keep);
+    recordRejections(rejected);
+    if (rejected.length) {
+      console.log(
+        `rejected: ${rejected.length} recorded to watchdog-rejections.json ` +
+          `(fed back into the curator prompt so they are not re-proposed)`
+      );
+    }
+    log(
+      `apply-review: approved ${counts.approved}, rejected ${counts.rejected}, applied ${counts.applied}, ` +
+        `failed ${counts.failed}, refused ${counts.refused}, swept ${sw.dropped.length}; queue ${review.length} -> ${keep.length}`
+    );
+    console.log(`queue: ${keep.length} remaining`);
+  } finally {
+    releaseLock();
+  }
 }
 
 function parseArgs(argv) {

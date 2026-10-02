@@ -18,7 +18,8 @@
  */
 
 import { runCurator, canonicalProject } from "./summarize.mjs";
-import { queueReview, log } from "./state.mjs";
+import { applyDemotion } from "./apply.mjs";
+import { queueReview, log, refreshLock } from "./state.mjs";
 
 export const SINGLETON_TOPICS = ["session-resume", "todo-state", "playbook"];
 export const CONSOLIDATE_EVERY_MS = 30 * 24 * 60 * 60 * 1000;
@@ -61,7 +62,7 @@ Below are older memories for project "${project}", grouped by topic. Propose how
 sharp: fewer, denser, still-true memories rank first; narration, duplicates and superseded state stop competing.
 
 Rules — precision over coverage, and every proposal carries evidence quoting the memories it rests on:
-- MERGE only memories that describe the same thing; the replacement must lose no fact that is still true. Never merge a LESSON with a non-lesson. Keep the replacement self-contained with absolute dates.
+- MERGE only memories that describe the same thing; the replacement must lose no fact that is still true. Never merge a LESSON with a non-lesson. Keep the replacement self-contained with absolute dates. Leave out cost figures in dollars or any other currency (API spend, bills); state that impact in tokens, duration or a relative multiplier.
 - DEMOTE (lower importance) memories that are narration, transient status, or clearly superseded by a later memory in this batch. Give the new importance (0.2–0.5).
 - DELETE only byte-near duplicates or transient notes with no durable content (a build passed, a file was read). When in doubt, demote instead.
 - Do not touch lessons except to merge exact duplicates. Do not propose more than 15 items total. Skip anything you are unsure about — a wrong forget cannot be undone.
@@ -95,6 +96,9 @@ export async function consolidateProject(store, project, cfg, review, opts = {})
   );
   for (const [i, lines] of batches.entries()) {
     const t0 = Date.now();
+    // Heartbeat before each model call (up to cfg.timeoutMs): a live run must
+    // never look hung to apply-review waiting on the same lock.
+    refreshLock();
     const run = runCurator(buildPrompt(canon, lines), { model: cfg.model, effort: cfg.effort, thinkingTokens: cfg.thinkingTokens, timeoutMs: cfg.timeoutMs, raw: true });
     if (!run.ok) {
       counts.failed++;
@@ -111,8 +115,10 @@ export async function consolidateProject(store, project, cfg, review, opts = {})
     }
     for (const d of r.demotions || []) {
       if (!known.has(d.id) || !(d.importance >= 0 && d.importance <= 1)) continue;
-      counts.demotions++;
-      if (!opts.dryRun) queueReview(review, "demote", { id: d.id, importance: d.importance, project: canon }, d.evidence, key);
+      // Applied, not queued (since 2026-10-02): reversible, see applyDemotion.
+      const res = opts.dryRun ? { status: "dry-run" } : applyDemotion(store, { id: d.id, importance: d.importance, project: canon, evidence: d.evidence });
+      if (res.status === "applied" || res.status === "dry-run") counts.demotions++;
+      if (res.status === "applied") log(`consolidate ${canon}: demoted ${d.id} ${res.from} -> ${res.to}`);
     }
     for (const d of r.deletions || []) {
       if (!known.has(d.id)) continue;

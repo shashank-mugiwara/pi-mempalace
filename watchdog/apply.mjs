@@ -6,8 +6,11 @@
  *     skipped when an existing memory matches at >= 0.92 similarity)
  *   - new KG facts
  *   - supersedes with confidence "high" whose target memory has
- *     importance < 0.85 (forget old + save replacement)
+ *     importance < 0.85 (save replacement, then forget old)
  *   - kg invalidations with confidence "high" (invalidate + optional re-add)
+ *
+ * Never auto-applied: content carrying a cost figure (looksLikeCostFigure);
+ * it is skipped, counted as currency_skipped and logged.
  *
  * Queued for human review (watchdog-review.json → AskUserQuestion in pi):
  *   - supersedes targeting importance >= 0.85 memories, or confidence "low"
@@ -24,16 +27,49 @@
  *     casing against existing projects and refuses working-directory names.
  */
 
-import { log, queueReview } from "./state.mjs";
+import { log, queueReview, recordDemotions } from "./state.mjs";
 import { canonicalProject } from "./summarize.mjs";
 import { isNonProjectName } from "../extensions/pi-mempalace/memory_store.ts";
 
 const AUTO_IMPORTANCE_CAP = 0.85;
 const DUP_SIMILARITY = 0.92;
 
+/**
+ * Cost figures (API spend, cloud bills, per-run cost) are banned from the
+ * palace by the no-dollar rule. That rule lives in ~/.claude/CLAUDE.md, and the
+ * curator runs with --setting-sources "", so it reaches the model only through
+ * the curator prompt. This is the deterministic backstop for the writes no
+ * human reviews: a match skips the write and logs it. Code spans are ignored
+ * so `awk '{print $10}'` or a `$1` in a command is not mistaken for money, and
+ * a bare single-digit `$5` is too ambiguous to call. Rupee amounts are left
+ * alone: lakh/crore figures are product facts in this install, not spend.
+ */
+const COST_PATTERNS = [
+  /\$\s?\d[\d,]*\.\d+/, // $0.42, $1,234.50
+  /\$\s?\d{1,3}(?:,\d{3})+/, // $1,200
+  /\$\s?\d+(?:\.\d+)?\s?(?:k|K|M|B|bn|million|billion)\b/, // $3k, $1.2M
+  /\$\d{2,}/, // $40, $250
+  /\$\s?\d+(?:\.\d+)?\s*(?:\/|per\s+)\s*(?:mo|month|day|hr|hour|week|year|yr|run|call|request|session|tick|token)\b/i,
+  /\b(?:USD|US\$)\s?\d/,
+  /\d\s?USD\b/,
+];
+
+export function looksLikeCostFigure(text) {
+  const prose = String(text || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`\n]*`/g, " ");
+  return COST_PATTERNS.some((re) => re.test(prose));
+}
+
+/** Log line for a skipped write; the figure itself is masked, not repeated. */
+function logCostSkip(kind, project, content) {
+  const gist = String(content).replace(/\s+/g, " ").slice(0, 100).replace(/\$\s?[\d.,]+\s?[kKMB]?/g, "$<n>");
+  log(`currency: skipped auto-applied ${kind} for ${project} (cost figure; no-dollar rule): ${gist}`);
+}
+
 export async function applyResult(store, candidate, result, reviewItems, opts = {}) {
   const dry = !!opts.dryRun;
-  const counts = { saved: 0, kg_added: 0, superseded: 0, kg_invalidated: 0, queued: 0, dup_skipped: 0, playbook_saved: 0, playbook_queued: 0, stale_dropped: 0, bad_project: 0 };
+  const counts = { saved: 0, kg_added: 0, superseded: 0, kg_invalidated: 0, queued: 0, dup_skipped: 0, playbook_saved: 0, playbook_queued: 0, stale_dropped: 0, bad_project: 0, currency_skipped: 0 };
   const projects = safeProjects(store);
   const src = `session-watchdog:${candidate.source}`;
   const project_ = (name) => {
@@ -46,6 +82,11 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
     if (!m?.content || typeof m.content !== "string") continue;
     const project = project_(m.project);
     if (!project) continue;
+    if (looksLikeCostFigure(m.content)) {
+      counts.currency_skipped++;
+      logCostSkip("memory", project, m.content);
+      continue;
+    }
     const importance = Math.min(Number(m.importance) || 0.6, AUTO_IMPORTANCE_CAP);
     if (await isNearDuplicate(store, m.content)) {
       counts.dup_skipped++;
@@ -146,6 +187,11 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
     }
 
     // kind is command|location, destination is memory, confidence is high.
+    if (looksLikeCostFigure(p.content)) {
+      counts.currency_skipped++;
+      logCostSkip("playbook", project, p.content);
+      continue;
+    }
     if (await isNearDuplicate(store, p.content)) {
       counts.dup_skipped++;
       continue;
@@ -216,16 +262,25 @@ export async function applyResult(store, candidate, result, reviewItems, opts = 
       counts.queued++;
       continue;
     }
+    if (looksLikeCostFigure(s.replacement_content)) {
+      // The target stays as it is; nothing is lost by not replacing it.
+      counts.currency_skipped++;
+      logCostSkip("supersede", supProject, s.replacement_content);
+      continue;
+    }
     if (!dry) {
       try {
-        store.delete(s.forget_memory_id);
-        await store.store({
+        // Save first, delete second: a failed save used to leave the target
+        // already deleted and its replacement never written.
+        const res = await store.store({
           content: s.replacement_content.trim(),
           project: supProject,
           topic: cleanTopic(s.topic || target.topic),
           source: src,
           importance: Math.min(Number(s.importance) || Number(target.importance) || 0.6, AUTO_IMPORTANCE_CAP),
         });
+        if (res?.status !== "stored" && res?.status !== "duplicate") continue;
+        if (!sameMemoryFamily(res.id, s.forget_memory_id)) deleteIfPresent(store, s.forget_memory_id);
       } catch {
         continue;
       }
@@ -298,9 +353,40 @@ export function resolveProject(name, sessionProject, projects) {
   return sessionOk;
 }
 
-function sameMemoryFamily(a, b) {
+export function sameMemoryFamily(a, b) {
   if (!a || !b) return false;
   return String(a).replace(/_c\d+$/, "") === String(b).replace(/_c\d+$/, "");
+}
+
+/**
+ * Whether any row of `id`'s family exists: true, false, or null when the
+ * lookup itself failed. Callers treat null as present, so a store error never
+ * silently drops a proposal.
+ */
+export function memoryFamilyExists(store, id) {
+  try {
+    const family = String(id).replace(/_c\d+$/, "");
+    return store.has(id) || store.has(family) || store.has(`${family}_c0`);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Delete a memory family that may already be gone. store() supersedes
+ * singleton topics (session-resume, todo-state, playbook) by itself, so the
+ * target of a supersede is often deleted before this runs; that is success.
+ * Any other error is rethrown.
+ */
+export function deleteIfPresent(store, id) {
+  if (!id) return "no target id";
+  try {
+    store.delete(id);
+    return `deleted ${id}`;
+  } catch (e) {
+    if (/not found/i.test(String(e?.message))) return `${id} was already gone`;
+    throw e;
+  }
 }
 
 function safeProjects(store) {
@@ -311,7 +397,7 @@ function safeProjects(store) {
   }
 }
 
-function cleanTopic(topic) {
+export function cleanTopic(topic) {
   const t = String(topic || "").trim().toLowerCase().replace(/\s+/g, "-");
   return t && t !== "general" ? t : "session-watchdog";
 }
@@ -334,12 +420,37 @@ function findMemory(store, id) {
   // recall window may miss it; fall back to existence check only. Family-aware
   // (`mem_x` and its chunks `mem_x_c0…` are one memory, and store.delete()
   // treats them that way), so a proposal naming a chunk id is not "missing".
+  // A failed lookup counts as present so a store error never silently drops a
+  // proposal; unknown importance is treated as high, so it is queued.
+  if (memoryFamilyExists(store, id) === false) return null;
+  return { importance: 1.0, topic: "unknown" };
+}
+
+/**
+ * Lower a memory's importance, recording the old value first.
+ *
+ * Demotions are applied without review since 2026-10-02 (Shashank, harness
+ * audit: "Auto-apply demotions"). They only re-weight ranking and never remove
+ * a memory, and watchdog-demoted.json keeps `from`, so each one can be undone
+ * with setImportance(id, from). A proposal that would not lower the importance
+ * is not a demotion and is skipped.
+ */
+export function applyDemotion(store, { id, importance, project, evidence = "", source = "consolidation" }) {
+  const to = Number(importance);
+  if (!id || !(to >= 0 && to <= 1)) return { status: "invalid" };
+  const family = String(id).replace(/_c\d+$/, "");
+  let from = null;
   try {
-    const family = String(id).replace(/_c\d+$/, "");
-    const exists = store.has(id) || store.has(family) || store.has(`${family}_c0`);
-    return exists ? { importance: 1.0, topic: "unknown" } : null; // unknown importance ⇒ treated as high ⇒ queued
+    const row = store.db
+      .prepare(`SELECT MAX(importance) AS importance FROM memories WHERE id = ? OR id = ? OR parent_id = ?`)
+      .get(id, `${family}_c0`, `${family}_c0`);
+    from = row?.importance ?? null;
   } catch {
-    // Lookup failed: treat as present so a store error never silently drops a proposal.
-    return { importance: 1.0, topic: "unknown" };
+    return { status: "unreadable" };
   }
+  if (from === null) return { status: "missing" };
+  if (!(to < from)) return { status: "not-lower", from, to };
+  recordDemotions([{ id, project, from, to, source, evidence: String(evidence).slice(0, 300), at: new Date().toISOString() }]);
+  store.setImportance(id, to);
+  return { status: "applied", from, to };
 }

@@ -93,10 +93,15 @@ export async function gatherContext(store, candidate) {
 export function canonicalProject(name, projects) {
   if (!name) return "general";
   const lower = name.toLowerCase();
-  for (const p of Object.keys(projects || {})) {
-    if (p.toLowerCase() === lower) return p; // reuse exact canonical casing
+  // Reuse existing casing. When case variants already coexist (StandardSpec
+  // with 21 memories, standardspec with 2), file under the larger one so the
+  // stray variant stops growing.
+  let best = null;
+  for (const [p, count] of Object.entries(projects || {})) {
+    if (p.toLowerCase() !== lower) continue;
+    if (best === null || Number(count) > Number(projects[best])) best = p;
   }
-  return name;
+  return best ?? name;
 }
 
 function readVaultExcerpt(project) {
@@ -156,6 +161,7 @@ ${projectList || "(empty store)"}
 ## Conventions (non-negotiable)
 - Save only durable, future-useful signal: decisions + why, plans, non-obvious findings, changed facts, touched file paths. NOT narration, tool noise, or anything trivially recoverable from git.
 - Memories must be self-contained (readable months later, absolute dates, project named). NEVER include secrets, tokens, or credential values — redact to a description.
+- Never write a cost figure in dollars or any other currency (API spend, cloud bills, per-run or per-token cost) in a memory, lesson, playbook entry, supersede replacement or doubt. Describe that impact in tokens, run duration or a relative multiplier ("~5x"). Amounts that are facts about the product itself, such as a loan limit in lakh or crore, are not cost figures.
 - topic: lowercase-kebab, reuse the topics visible in the related memories above when they fit; never "general".
 - importance: 0.9 architecture decisions/hard lessons, 0.7-0.8 durable findings/plans, 0.5-0.6 useful context. Below 0.5 → don't save it.
 - KG predicates (snake_case, this exact vocabulary): uses, depends_on, calls, runtime_dependency, implements, decided, status, located_at, provides, requires, is_a. New entities need an is_a fact.

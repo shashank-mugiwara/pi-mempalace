@@ -1,5 +1,45 @@
 # Fork changelog
 
+## 0.8.10 — 2026-10-02 — explorer selects instead of paraphrasing; apply-review takes the lock; reversible demotions
+
+From the 2026-10-02 cross-agent harness audit (harness bead hx-5b09) and
+Shashank's choices in it: "Auto-apply demotions", "Merge stray palace
+projects", strip dollar figures (bead hx-9es.8).
+
+- **First-prompt explorer** (`hooks/claude-first-prompt-explorer.mjs`, used by
+  Claude Code and codex). It had drifted back to 31.3s on the audit prompt;
+  nearly all of it was the 8-turn Bash tool loop. The probes (semantic search
+  over the palace and the session's project, lessons, recent project memories,
+  knowledge-graph facts for entities the prompt names) now run in parallel in
+  the hook, and Haiku takes one turn with no tools and no thinking to pick up
+  to six ids. The chosen memories are printed verbatim with their saved date:
+  the old prompt asked for "the distilled fact/decision" and rewrote fixed
+  incidents as open to-dos. Same prompt: 5.6s. The project is resolved from
+  the git toplevel, the main checkout behind a worktree, the origin repo name,
+  then the cwd basename (36 of 106 sessions had matched no project). One JSON
+  line per run goes to `explorer.log`.
+- **apply-review** takes `watchdog.lock` (waits up to 2 minutes, then exits 1
+  having applied nothing) and reads the queue only after holding it, so a tick
+  can no longer undo verdicts. A supersede or merge saves its replacement
+  before deleting anything, and never deletes its own family. Every write
+  resolves its project through `resolveProject`; an unresolvable item stays
+  queued with a reason. Two approved supersedes for one target are refused up
+  front (bead hx-r8e). Each run logs its counts to `watchdog.log`.
+- **Lock**: broken only when its holder is gone, unreadable and old, or silent
+  for 3 hours; ticks and consolidation heartbeat before each model call.
+- **Queue sweep** at the start of every tick and apply-review: supersedes whose
+  target is gone, and all but the newest per target, move to
+  `watchdog-swept.json` whole (5 swept on the first run).
+- **Demotions apply automatically** and are recorded first in
+  `watchdog-demoted.json` with the old importance, so each can be undone with
+  `setImportance(id, from)`. A proposal that would not lower importance is
+  skipped.
+- **No currency figures**: the curator and merge prompts forbid them, and a
+  backstop skips any unreviewed write that carries one (`looksLikeCostFigure`).
+- **Log rotation**: `watchdog.log` and `watchdog-launchd.log` move to `.1` past
+  1 MB at the start of a tick.
+- Tests: `watchdog/apply-review.test.mjs` (23), alongside `bench/gate-unit.mjs`.
+
 ## 0.8.9 — 2026-09-23 — watchdog on Claude Haiku 4.5; isolated nested `claude -p`; queue hygiene
 
 From the 2026-09-23 harness audit and Shashank's instruction "haiku 4.5 model
